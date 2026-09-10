@@ -32,7 +32,7 @@ circseq:
   coverage_per_copy: 30
 
 detection:
-  microdna_map_model: "./save/6.pth"
+  microdna_map_model: "./models/6.pth"
   microdna_map_limit: "0.99"
   circlemmap_threads: 8
   threads: 8
