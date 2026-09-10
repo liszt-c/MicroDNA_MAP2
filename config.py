@@ -1,0 +1,54 @@
+"""
+config.py - 全局配置中心
+"""
+from pathlib import Path
+
+# 项目根目录
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+# 数据目录
+DATA_DIR = PROJECT_ROOT / "data"
+RAW_DATA_DIR = DATA_DIR / "raw"
+PROCESSED_DATA_DIR = DATA_DIR / "processed"
+
+# 参考基因组
+REFS_DIR = PROJECT_ROOT / "refs"
+HG19_FA = REFS_DIR / "hg19.fa"
+# 可选: CNVkit 参考 profile (.cnn)。存在时 batch 使用 -r，否则退化为 flat reference
+CNVKIT_REF_CNN = REFS_DIR / "cnvkit_ref.cnn"
+
+# 模型与结果
+MODEL_DIR = PROJECT_ROOT / "models"
+RESULTS_DIR = PROJECT_ROOT / "results"
+PREDICTIONS_DIR = RESULTS_DIR / "predictions"
+METRICS_DIR = RESULTS_DIR / "metrics"
+CNVKIT_TEMP_DIR = RESULTS_DIR / "cnvkit_temp"
+
+# 确保目录存在 (exist_ok=True 在多进程下安全)
+for _dir in [DATA_DIR, RAW_DATA_DIR, PROCESSED_DATA_DIR, REFS_DIR,
+             MODEL_DIR, RESULTS_DIR, PREDICTIONS_DIR, METRICS_DIR, CNVKIT_TEMP_DIR]:
+    _dir.mkdir(parents=True, exist_ok=True)
+
+# 默认超参数
+DEFAULT_BATCH_SIZE = 256
+DEFAULT_EPOCHS = 40
+DEFAULT_LEARNING_RATE = 0.001
+DEFAULT_WEIGHT_DECAY = 1e-3
+DEFAULT_STEP_SIZE = 5           # 学习率衰减间隔 (epoch)
+DEFAULT_GAMMA = 0.6             # 学习率衰减率
+DEFAULT_FLOODING_B = 0.0001     # Flooding 正则化参数, 0 表示关闭
+SEQUENCE_LENGTH = 400
+NUM_CLASSES = 2
+RANDOM_SEED = 42
+NUM_WORKERS = 4
+
+# 滑动窗口推理参数 (与原版 run.py 保持一致)
+SLIDE_STEP1 = 10        # 第一次滑动步长 (bp)
+SLIDE_WINDOW2 = 10      # 第二次滑动窗口大小 (窗口数)
+SLIDE_STEP2 = 3         # 第二次滑动步长 (窗口数)
+
+# 外部工具路径 (确保在 PATH 中, 或在此改为绝对路径)
+BOWTIE2 = "bowtie2"
+BOWTIE2_BUILD = "bowtie2-build"
+SAMTOOLS = "samtools"
+CNVKIT = "cnvkit.py"
