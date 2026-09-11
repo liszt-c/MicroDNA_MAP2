@@ -7,27 +7,24 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Iterator, Tuple
 
 
 def setup_logger(name: str, log_file: Path = None, level=logging.INFO) -> logging.Logger:
     """设置日志记录器 (防止重复添加 handler)"""
     logger = logging.getLogger(name)
-    if logger.handlers:          # 已初始化过, 直接返回
+    if logger.handlers:  # 已初始化过, 直接返回
         return logger
     logger.setLevel(level)
-    logger.propagate = False     # 避免向 root 传播造成重复输出
-
+    logger.propagate = False  # 避免向 root 传播造成重复输出
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
-
     if log_file:
         file_handler = logging.FileHandler(log_file, encoding='utf-8')
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
-
     return logger
 
 
@@ -83,9 +80,36 @@ def parse_fasta_text(text: str):
 
 
 def parse_fasta_file(path: Path):
-    """解析 FASTA 文件, 返回 [(header_line, sequence), ...]"""
+    """解析 FASTA 文件, 返回 [(header_line, sequence), ...] (整读入内存, 仅适用于小文件)"""
     with open(path, 'r', encoding='utf-8', errors='replace') as f:
         return parse_fasta_text(f.read())
+
+
+def iter_fasta_file(path: Path) -> Iterator[Tuple[str, str]]:
+    """
+    惰性解析 FASTA 文件, 逐条 yield (header_line, sequence)。
+    - 内存占用 O(单条序列长度), 与文件总大小无关, 适合大规模扫描
+    - header_line 含 '>' 前缀
+    - 支持多行折叠格式
+    """
+    path = Path(path)
+    header = None
+    parts = []
+    with open(path, 'r', encoding='utf-8', errors='replace') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith('>'):
+                if header is not None:
+                    yield header, ''.join(parts)
+                header = line
+                parts = []
+            else:
+                if header is not None:
+                    parts.append(line)
+    if header is not None:
+        yield header, ''.join(parts)
 
 
 def read_fai(ref_fa: Path) -> dict:
@@ -130,7 +154,7 @@ def extract_regions(ref_fa: Path, regions: list, samtools_bin: str = 'samtools')
     if not lengths:
         raise FileNotFoundError(f".fai index missing for {ref_fa}, run ensure_faidx first")
 
-    valid = []       # [(orig_key, clamped_chrom, clamped_start, clamped_end)]
+    valid = []   # [(orig_key, clamped_chrom, clamped_start, clamped_end)]
     skipped = []
     for region in regions:
         chrom, start, end = region
