@@ -9,7 +9,7 @@ genome:
   gap_bed: null
   quick_chromosomes: ["chr21", "chr22"]
   background_chroms: ["chr1", "chr2", "chr3", "chr4", "chr5"]
-  cnvkit_reference: "./cnvkit_do/hg19_cnvkit_filtered_ref.cnn"
+  cnvkit_reference: "./ref/hg19_cnvkit_filtered_ref.cnn"
 
 simulation:
   num_sites: 10000
