@@ -5,6 +5,8 @@ run_benchmark.py
 ================
 
 统一入口，按阶段执行 Spike-in 基准测试。
+支持使用逗号分隔指定多个执行阶段，例如:
+python benchmark/run_benchmark.py --config benchmark/config_real.yaml --quick --phase 1,2,3,5,7
 """
 
 from __future__ import annotations
@@ -108,16 +110,22 @@ def phase1_generate(config: dict, dry_run: bool = False) -> int:
         "--output_dir", str(out_dir),
     ]
 
-    # 检查是否启用真实模式
+    if config.get("quick", False):
+        bg_chroms = ",".join(config["genome"]["quick_chromosomes"])
+    else:
+        bg_chroms = ",".join(config["genome"]["background_chroms"])
+    cmd += ["--background_chroms", bg_chroms]
+
     use_real = sim.get("use_real_microdna", False)
     input_dir = sim.get("input_fasta_dir")
+    
     if use_real and input_dir:
         input_dir_path = Path(input_dir)
-        if input_dir_path.is_dir():
+        if input_dir_path.exists():
             cmd += ["--input_fasta_dir", str(input_dir_path)]
-            print(f"[INFO] 使用真实 microDNA 序列目录: {input_dir_path}")
+            print(f"[INFO] 使用真实 microDNA 序列输入: {input_dir_path}")
         else:
-            print(f"[WARN] 真实 microDNA 目录不存在: {input_dir_path}，将使用随机模式。")
+            print(f"[WARN] 真实 microDNA 输入路径不存在: {input_dir_path}，将回退到随机模式。")
 
     if config["genome"].get("gap_bed"):
         cmd += ["--gap_bed", str(config["genome"]["gap_bed"])]
@@ -133,7 +141,7 @@ def phase2_circseq(config: dict, dry_run: bool = False) -> int:
     truth_dir = Path(config["experiment"]["output_dir"]) / "truth"
     out_dir = Path(config["experiment"]["output_dir"]) / "circseq"
     out_dir.mkdir(parents=True, exist_ok=True)
-    threads = config["detection"].get("threads", 8)  # 使用 detection.threads 或默认 8
+    threads = config["detection"].get("threads", 8)  
     cmd = [
         sys.executable, str(script),
         "--truth_dir", str(truth_dir),
@@ -256,8 +264,37 @@ def phase6_circle_wgs(config: dict, dry_run: bool = False) -> int:
     return 0
 
 
-def phase7_evaluate(config: dict, dry_run: bool = False) -> int:
-    print("\n=== Phase 7: 评估 ===")
+def phase7_microdna_circseq(config: dict, dry_run: bool = False) -> int:
+    print("\n=== Phase 7: MicroDNA Map on Circle-seq (跨模态评估) ===")
+    script = BENCHMARK_DIR / "detect" / "run_microdna_map.py"
+    if not script.exists():
+        return 1
+    circseq_dir = Path(config["experiment"]["output_dir"]) / "circseq"
+    out_base = Path(config["experiment"]["output_dir"]) / "detect" / "microdna_circseq"
+    threads = config["detection"]["threads"]
+    model = config["detection"]["microdna_map_model"]
+    limit = config["detection"]["microdna_map_limit"]
+    cnvkit_ref = config["genome"].get("cnvkit_reference")
+    for cn in config["simulation"]["copy_numbers"]:
+        r1 = circseq_dir / f"cn{cn}" / "circseq_R1.fastq"
+        r2 = circseq_dir / f"cn{cn}" / "circseq_R2.fastq"
+        if not (r1.exists() and r2.exists()):
+            continue
+        out_dir = out_base / f"cn{cn}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cmd = [sys.executable, str(script), "--r1", str(r1), "--r2", str(r2),
+               "--reference", str(config["genome"]["reference"]),
+               "--output_dir", str(out_dir), "--model_path", str(model),
+               "--limit", str(limit), "--threads", str(threads)]
+        if cnvkit_ref and Path(cnvkit_ref).exists():
+            cmd += ["--cnvkit_reference", str(cnvkit_ref)]
+        if run_cmd(cmd, dry_run=dry_run, cwd=PROJECT_ROOT) != 0:
+            return 1
+    return 0
+
+
+def phase8_evaluate(config: dict, dry_run: bool = False) -> int:
+    print("\n=== Phase 8: 评估 ===")
     truth_bed = Path(config["experiment"]["output_dir"]) / "truth" / "microdna_truth.bed"
     script = BENCHMARK_DIR / "evaluate" / "metrics.py"
     if not script.exists():
@@ -270,6 +307,7 @@ def phase7_evaluate(config: dict, dry_run: bool = False) -> int:
     tasks = [
         ("circlemmap_circseq", Path(config["experiment"]["output_dir"]) / "detect" / "circlemmap"),
         ("microdna_map_wgs", Path(config["experiment"]["output_dir"]) / "detect" / "microdna_map"),
+        ("microdna_map_circseq", Path(config["experiment"]["output_dir"]) / "detect" / "microdna_circseq"),
         ("circlemmap_wgs", Path(config["experiment"]["output_dir"]) / "detect" / "circlemmap_wgs"),
     ]
     for name, detected_dir in tasks:
@@ -285,8 +323,8 @@ def phase7_evaluate(config: dict, dry_run: bool = False) -> int:
     return 0
 
 
-def phase8_visualize(config: dict, dry_run: bool = False) -> int:
-    print("\n=== Phase 8: 可视化与报告 ===")
+def phase9_visualize(config: dict, dry_run: bool = False) -> int:
+    print("\n=== Phase 9: 可视化与报告 ===")
     eval_base = Path(config["experiment"]["output_dir"]) / "evaluation"
     vis_dir = Path(config["experiment"]["output_dir"]) / "visualization"
     vis_dir.mkdir(parents=True, exist_ok=True)
@@ -297,6 +335,7 @@ def phase8_visualize(config: dict, dry_run: bool = False) -> int:
     lod_cmd = [
         sys.executable, str(plot_script), "--plot", "lod",
         "--microdna_metrics", str(eval_base / "microdna_map_wgs" / "summary_metrics.tsv"),
+        "--microdna_circseq_metrics", str(eval_base / "microdna_map_circseq" / "summary_metrics.tsv"),
         "--circseq_metrics", str(eval_base / "circlemmap_circseq" / "summary_metrics.tsv"),
         "--circseq_wgs_metrics", str(eval_base / "circlemmap_wgs" / "summary_metrics.tsv"),
         "--output_dir", str(vis_dir),
@@ -305,6 +344,7 @@ def phase8_visualize(config: dict, dry_run: bool = False) -> int:
     comp_cmd = [
         sys.executable, str(plot_script), "--plot", "comparison",
         "--microdna_metrics", str(eval_base / "microdna_map_wgs" / "summary_metrics.tsv"),
+        "--microdna_circseq_metrics", str(eval_base / "microdna_map_circseq" / "summary_metrics.tsv"),
         "--circseq_metrics", str(eval_base / "circlemmap_circseq" / "summary_metrics.tsv"),
         "--circseq_wgs_metrics", str(eval_base / "circlemmap_wgs" / "summary_metrics.tsv"),
         "--output_dir", str(vis_dir),
@@ -325,6 +365,7 @@ def generate_report(config: dict, eval_base: Path, vis_dir: Path) -> None:
         f.write(f"Copy numbers: {config['simulation']['copy_numbers']}\n\n")
         methods = {
             "MicroDNA Map (WGS)": eval_base / "microdna_map_wgs" / "summary_metrics.tsv",
+            "MicroDNA Map (Circle-seq)": eval_base / "microdna_map_circseq" / "summary_metrics.tsv",
             "Circle-Map (Circle-seq)": eval_base / "circlemmap_circseq" / "summary_metrics.tsv",
             "Circle-Map (WGS)": eval_base / "circlemmap_wgs" / "summary_metrics.tsv",
         }
@@ -349,7 +390,10 @@ def generate_report(config: dict, eval_base: Path, vis_dir: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="统一基准测试入口")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    parser.add_argument("--phase", type=int, choices=range(0, 9), default=None)
+    parser.add_argument(
+        "--phase", type=str, default=None,
+        help="指定运行的阶段，使用逗号分隔 (例如 '1,2,3,5,7')。如果不提供，默认按顺序执行 0 到 9 的所有阶段。"
+    )
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -374,11 +418,26 @@ def main() -> None:
         4: phase4_circle_circseq,
         5: phase5_microdna_wgs,
         6: phase6_circle_wgs,
-        7: phase7_evaluate,
-        8: phase8_visualize,
+        7: phase7_microdna_circseq,
+        8: phase8_evaluate,
+        9: phase9_visualize,
     }
 
-    to_run = [args.phase] if args.phase is not None else list(range(9))
+    # 解析逗号分隔的 phase 参数
+    if args.phase is not None:
+        try:
+            # 剥离两边空格、按逗号切分，转换为整数并去重排序
+            to_run = sorted(list(set(int(p.strip()) for p in args.phase.split(","))))
+            for p in to_run:
+                if p not in phases:
+                    print(f"[ERROR] 无效的 Phase 阶段: {p}。有效阶段为 0 到 9。", file=sys.stderr)
+                    sys.exit(1)
+        except ValueError:
+            print("[ERROR] --phase 参数格式错误，请使用逗号分隔的数字，例如 '1,2,3,5,7'", file=sys.stderr)
+            sys.exit(1)
+    else:
+        to_run = list(range(10))
+
     total_start = time.time()
     for p in to_run:
         ret = phases[p](config, args.dry_run)
@@ -386,6 +445,7 @@ def main() -> None:
             print(f"[ERROR] Phase {p} 失败")
             sys.exit(1)
         print(f"[INFO] Phase {p} 完成")
+    
     if not args.dry_run:
         print(f"[INFO] 全部流程完成，总耗时 {time.time() - total_start:.2f}s")
 

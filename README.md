@@ -1,120 +1,186 @@
 # MicroDNA Map v2.0
 
-基于 ResNet-SelfAttention 的 eccDNA 识别与分析平台。  
-统一配置管理、合并 FASTA 存储、标准化训练/推理接口、完整 CNVkit 流程集成。
+基于 ResNet-SelfAttention 架构的 eccDNA (MicroDNA) 识别与分析平台。
+本项目提供了统一的配置管理、惰性数据加载机制、标准化的训练与推理接口，并深度集成了从测序原始数据(FASTQ)到变异提取(CNVkit)再到深度学习识别的端到端管线。特别引入了**双重负例挖掘（Offline & Multi-round Online HNM）**机制以有效抑制预测时的假阳性“拖尾”现象。
 
 ## 项目结构
 
 ```text
 MicroDNA_Map/
-├── config.py                  # 全局配置中心
-├── requirements.txt           # Python 依赖
+├── config.py                  # 全局配置中心 (超参数、路径、工具链、多阶段 HNM 配置)
+├── requirements.txt           # Python 依赖清单
 ├── data/
-│   ├── raw/                   # 原始 Excel / FASTQ
-│   └── processed/             # 合并后的 eccDNA.fa / otherDNA.fa
-├── refs/                      # 参考基因组 (hg19.fa + .fai)
-├── models/                    # 训练权重 (best_model.pth / last_model.pth)
+│   ├── raw/                   # 原始标注 Excel / 双端 FASTQ 文件
+│   └── processed/             # 处理并合并后的模型输入 (eccDNA.fa / otherDNA.fa)
+├── refs/                      # 参考基因组目录 (需包含 hg19.fa 及其索引)
+├── models/                    # 训练输出目录 (保存权重文件及 TensorBoard 日志)
 ├── results/
-│   ├── predictions/           # 推理结果 (BED / FASTA / TSV)
-│   ├── metrics/               # 评估报告与图表
-│   └── cnvkit_temp/           # CNVkit 中间文件
+│   ├── predictions/           # 推理结果目录 (BED / FASTA / TSV)
+│   ├── metrics/               # 评估报告与可视化图表
+│   └── cnvkit_temp/           # 全流程中产生的 CNVkit 与比对中间文件
 ├── src/
 │   ├── __init__.py
-│   ├── dataprocess.py         # 序列清洗 + One-hot 编码 + Header 解析
-│   ├── dataloader.py          # PyTorch Dataset (字节偏移索引, 惰性加载)
-│   ├── model.py               # ResNet-SelfAttention (1D)
-│   ├── utils.py               # Logger / subprocess / samtools 批量提取
+│   ├── dataprocess.py         # 序列清洗、One-hot 编码、Header 解析
+│   ├── dataloader.py          # 高效 PyTorch Dataset
+│   ├── model.py               # 核心网络: ResNet-SelfAttention (1D)
+│   ├── utils.py               # 进程调度、samtools 序列提取等工具
+│   ├── hnm.py                 # 在线困难负例挖掘 (Online Hard Negative Mining) 核心逻辑
 │   └── pipeline/
-│       ├── __init__.py
-│       └── cnvkit_pipeline.py # CNVkit 全流程封装
+│       └── cnvkit_pipeline.py # FASTQ -> BAM -> CNV 提取自动化
 └── scripts/
-    ├── process_data.py        # Excel -> 合并 FASTA
-    ├── train.py               # 模型训练
-    ├── verify.py              # 模型评估
-    ├── predict.py             # 推理 (short / long)
-    └── batch_process.py       # FASTQ -> MicroDNA 全流程
+    ├── process_data.py        # 从 Excel 提取序列并转为 FASTA
+    ├── sample_negatives.py    # (离线挖掘) 全基因组随机采样背景片段
+    ├── train.py               # 模型训练脚本 (集成多阶段在线困难负例挖掘与类别平衡)
+    ├── ablation_layer_size.py # 自动化模型通道数 (LAYER_SIZE) 消融实验
+    ├── verify.py              # 模型验证脚本 (分类报告、混淆矩阵、ROC 曲线)
+    ├── compare_hnm.py         # 对比分析脚本 (解耦的 CSV 推理与 KDE 密度图绘制)
+    ├── predict.py             # 推理脚本 (短序列直出与长序列滑窗重叠扫描)
+    └── batch_process.py       # 端到端全流程脚本 (FASTQ -> CNV -> MicroDNA)
+
 ```
 
-## 安装
+## 环境与依赖安装
+
+推荐使用 Conda 创建隔离的运行环境：
 
 ```bash
-conda create -n microdna python==3.9
+conda create -n microdna python=3.9
 conda activate microdna
 pip install -r requirements.txt
 
-# PyTorch (根据 CUDA 版本选择)
-# https://pytorch.org/get-started/previous-versions/
-conda install pytorch==2.2.1 torchvision==0.17.1 torchaudio==2.2.1 \
-    pytorch-cuda=12.1 -c pytorch -c nvidia
+# PyTorch 安装 (请依据硬件 CUDA 版本调整)
+conda install pytorch==2.2.1 torchvision==0.17.1 torchaudio==2.2.1 pytorch-cuda=12.1 -c pytorch -c nvidia
 
-# 外部工具 (需在 PATH 中或在 config.py 中指定绝对路径)
-# bowtie2, samtools, cnvkit
-pip install cnvkit
+# 安装绘图与 CNVkit
+pip install seaborn cnvkit
+
 ```
 
-## 快速开始
+**外部工具链要求:**
+运行端到端流程及数据提取时，需确保以下生信工具在系统 `PATH` 中，或在 `config.py` 中指定绝对路径：
 
-### 1. 数据预处理
+* `bowtie2` 及 `bowtie2-build`
+* `samtools`
 
-将标注 Excel 放入 `data/raw/`, 参考基因组放入 `refs/hg19.fa`:
+---
+
+## 详细使用指南
+
+### 1. 数据准备与双重负例挖掘
+
+为了彻底压制模型推断时的假阳性“拖尾”问题，本项目在数据层面实施两步走的负例挖掘策略：一是离线的海量背景覆盖，二是在线的高效动态剔除。
+
+#### 1.1 提取确切标注序列 (`process_data.py`)
+
+提取 Excel 中的 eccDNA (正例) 与明确的 otherDNA (负例)。
 
 ```bash
-# eccDNA (短区域向两侧扩展取真实侧翼)
-python scripts/process_data.py \
-    --input data/raw/eccDNA_annotations.xlsx \
-    --label ecc --mode expand --ref refs/hg19.fa
+# 提取正例 (eccDNA)
+python scripts/process_data.py --input data/raw/eccDNA_annotations.xlsx --label ecc --mode expand --ref refs/hg19.fa
 
-# otherDNA (长跨度区域取正中间 400bp)
-python scripts/process_data.py \
-    --input data/raw/otherDNA_annotations.xlsx \
-    --label other --mode middle --min-span 600 --ref refs/hg19.fa
+# 提取已有负例 (otherDNA)
+python scripts/process_data.py --input data/raw/otherDNA_annotations.xlsx --label other --mode middle --min-span 600 --ref refs/hg19.fa
+
 ```
 
-> **注意**: 若 ecc / other 使用不同参考基因组 (如 hg19 vs GRCh38),  
-> 请分别准备并通过 `--ref` 指定。
+#### 1.2 离线全基因组背景覆盖 (`sample_negatives.py`)
 
-### 2. 训练
+自动剔除包含 N 的低质量区域（着丝粒、拼接缝等），以产生海量干净的基因组背景片段。
 
 ```bash
-python scripts/train.py --epochs 50 --batch-size 256 --balanced
+# 自动比例模式：计算并补充随机背景，直到负例总数为正例的 1.5 倍
+python scripts/sample_negatives.py --ratio 1.5 --ref refs/hg19.fa
+
 ```
 
-可选参数: `--lr`, `--weight-decay`, `--step-size`, `--gamma`,  
-`--flooding-b`, `--val-split`, `--seed`, `--output-dir`
+---
 
-### 3. 评估
+### 2. 模型训练与多阶段困难负例挖掘 (Multi-round HNM)
+
+在实际训练中，我们采用**多阶段级联挖掘策略**：首先进行 Base 训练（如 30 个 Epoch）；随后每进入一个新挖掘阶段，模型会自动加载前一阶段的 Best 模型权重，筛选出迷惑性最大的困难负例，并重置优化器再训练 20 个 Epoch。这种机制确保了模型能够逐层逼近最精确的分类边界。
 
 ```bash
-python scripts/verify.py --threshold 0.5
+# 基础训练 30 个 Epoch，再进行 1 轮 HNM（附加 20 个 Epoch），总计 50 Epoch
+python scripts/train.py --base-epochs 30 --hnm-rounds 1 --hnm-epochs 20 --batch-size 256 --balanced
+
 ```
 
-输出: `results/metrics/evaluation_report_threshold0.5.txt`  
-图表: `results/metrics/evaluation_metrics_threshold0.5.png`
+**HNM 专属参数:**
 
-### 4. 推理
+* `--base-epochs`: 基础阶段训练轮数 (默认 30)。
+* `--hnm-rounds`: 进行 HNM 挖掘的轮次，0 表示纯基础训练 (默认 1)。
+* `--hnm-epochs`: 每一轮 HNM 挖掘后附加的独立训练轮数 (默认 20)。
+* `--hnm-threshold`: 将被保留进行重点学习的困难负例概率底线 (默认 0.1)。
+* `--hnm-keep-easy`: 要保留的简单负例比例，维持全基因组背景分布不致灾难性遗忘 (默认 0.1)。
+
+---
+
+### 3. 困难负例挖掘效果验证 (`compare_hnm.py`)
+
+采用低耦合高内聚设计，支持独立执行长耗时推断（输出独立 CSV）与灵活的轻量级作图（包含 2x2 核密度估计对比图）。
+
+**方式一：一次性执行推断与制图**
 
 ```bash
-# 长序列滑窗识别
-python scripts/predict.py --model ./models/6.pth --input path/to/seqs.fa --mode long
+python scripts/compare_hnm.py \
+    --task all \
+    --model-base models/baseline_model.pth \
+    --model-hnm models/best_model.pth
 
-# 短序列分类
-python scripts/predict.py --model ./models/6.pth --input path/to/short.fa --mode short
 ```
 
-### 5. FASTQ 全流程
-
-将配对 FASTQ 放入 `data/raw/`:
+**方式二：分离式执行 (推荐)**
+阶段 1: 仅执行推断并持久化保存 CSV, 便于其他统计软件复用排查顽固假阳性。
 
 ```bash
-python scripts/batch_process.py --threads 16 --cleanup
+python scripts/compare_hnm.py \
+    --task infer \
+    --model-base models/baseline_model.pth \
+    --model-hnm models/best_model.pth
+
 ```
 
-流程: bowtie2 比对 → samtools sort/index → cnvkit batch+call →  
-候选区域提取 → 滑窗预测 → BED + FASTA 输出
+阶段 2: 修改绘图参数后，无需重新推理，直接读取 CSV 高速生成 PDF 报告。
 
-## 标签约定
+```bash
+python scripts/compare_hnm.py \
+    --task plot \
+    --csv-base results/metrics/hnm_comparison/Baseline_predictions.csv \
+    --csv-hnm results/metrics/hnm_comparison/HNM_Model_predictions.csv
 
-| 类别 | 数值 | 说明 |
-|------|------|------|
-| otherDNA | 0 | 基因组背景 / 非 eccDNA |
-| eccDNA | 1 | 染色体外环状 DNA |
+```
+
+---
+
+### 4. 序列级分类推断 (`predict.py`)
+
+内存友好的流式推断程序。
+
+```bash
+# 短序列模式 (定长短序列批量快速打分，生成 TSV 报表)
+python scripts/predict.py --input data/test_short.fa --mode short
+
+# 长序列模式 (未知长序列滑窗预测，支持重叠融合，输出标准 BED 与 FASTA)
+python scripts/predict.py --input data/test_long.fa --mode long --limit 0.99
+
+```
+
+---
+
+### 5. 端到端生信全流程挖掘 (`batch_process.py`)
+
+支持从测序下机数据到深度学习目标片段识别的一体化工作流。
+
+```bash
+python scripts/batch_process.py --input-dir data/raw --threads 16 --cleanup
+
+```
+
+**全流程运作机制:**
+
+1. **比对**: Bowtie2 执行 paired-end 映射生成 BAM。
+2. **CNV Call**: CNVkit (`batch` + `call`) 划定基因组显著变化区间。
+3. **坐标映射**: 利用 samtools 精确定位提取潜在变异序列至临时 FASTA。
+4. **神经网络筛选**: 启动长序列滑窗模型，在高维特征层面判定是否符合 eccDNA 的构造特征。
+5. **结果落盘**: `results/predictions/` 内输出高纯度的靶向区域清单 (.bed / .fasta)。
+

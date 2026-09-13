@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""
+scripts/ablation_layer_size.py - LAYER_SIZE 消融实验一键运行
+
+功能:
+  - 遍历指定的 LAYER_SIZE 列表, 逐个调用 train.py 的训练逻辑
+  - 每个 LAYER_SIZE 的输出隔离到 models/ablation_layer{N}/
+  - 结果实时追加到 CSV, 中断重跑时自动跳过已完成的 LAYER_SIZE
+  - 支持自定义 batch-size (大 LAYER_SIZE 可能需要减小以防 OOM)
+  - 支持 --dry-run 预览将要运行的配置
+
+用法:
+  # 默认范围 2-512 (2 的幂次)
+  python scripts/ablation_layer_size.py
+
+  # 自定义范围
+  python scripts/ablation_layer_size.py --sizes 2 4 8 16 32 64 128 256 512
+
+  # 大 LAYER_SIZE 时用更小的 batch-size
+  python scripts/ablation_layer_size.py --batch-size 64
+
+  # 预览不执行
+  python scripts/ablation_layer_size.py --dry-run
+"""
+import argparse
+import csv
+import importlib.util
+import sys
+import time
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from config import MODEL_DIR
+from src.utils import setup_logger
+
+logger = setup_logger('ablation')
+
+# CSV 列定义
+CSV_COLUMNS = [
+    'layer_size', 'batch_size', 'epochs', 'best_epoch',
+    'best_val_auc', 'best_val_acc', 'final_val_loss',
+    'final_val_acc', 'final_val_auc', 'final_val_f1',
+    'model_dir', 'elapsed_sec', 'status',
+]
+
+DEFAULT_SIZES = [2, 4, 8, 16, 32, 64, 128, 256, 512]
+ABLATION_ROOT = MODEL_DIR / "ablation_results"
+CSV_PATH = ABLATION_ROOT / "ablation_layer_size.csv"
+
+
+def load_train_main():
+    """动态导入 train.py 的 main 函数 (避免 argparse 冲突)"""
+    train_script = PROJECT_ROOT / "scripts" / "train.py"
+    spec = importlib.util.spec_from_file_location("train_module", str(train_script))
+    mod = importlib.util.module_from_spec(spec)
+    # 阻止 train.py 的 argparse 解析 ablation 脚本的参数
+    original_argv = sys.argv
+    sys.argv = ['train.py']
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        sys.argv = original_argv
+    return mod.main
+
+
+def get_completed_sizes(csv_path: Path) -> set:
+    """从已有 CSV 中读取已完成的 layer_size (status=ok)"""
+    completed = set()
+    if not csv_path.exists():
+        return completed
+    with open(csv_path, 'r', newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row.get('status') == 'ok':
+                try:
+                    completed.add(int(row['layer_size']))
+                except (ValueError, KeyError):
+                    pass
+    return completed
+
+
+def append_csv_row(csv_path: Path, row: dict):
+    """追加一行到 CSV, 若文件不存在则写入表头"""
+    file_exists = csv_path.exists()
+    with open(csv_path, 'a', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def run_single_ablation(train_main_fn, layer_size: int, batch_size: int,
+                        epochs: int, seed: int, balanced: bool,
+                        dry_run: bool = False) -> dict:
+    """运行单个 LAYER_SIZE 的训练, 返回结果字典"""
+    model_dir = ABLATION_ROOT / f"layer_{layer_size}"
+
+    result_row = {
+        'layer_size': layer_size,
+        'batch_size': batch_size,
+        'epochs': epochs,
+        'model_dir': str(model_dir),
+    }
+
+    if dry_run:
+        logger.info(f"[DRY-RUN] layer_size={layer_size}, bs={batch_size}, "
+                     f"output={model_dir}")
+        result_row.update({c: '' for c in CSV_COLUMNS if c not in result_row})
+        result_row['status'] = 'dry_run'
+        return result_row
+
+    logger.info(f"\n{'='*70}")
+    logger.info(f"  Ablation: LAYER_SIZE = {layer_size}")
+    logger.info(f"  Batch size = {batch_size}, Epochs = {epochs}")
+    logger.info(f"  Output dir = {model_dir}")
+    logger.info(f"{'='*70}\n")
+
+    start_time = time.time()
+
+    try:
+        # 通过修改 sys.argv 传参给 train.py 的 argparse
+        original_argv = sys.argv
+        train_argv = [
+            'train.py',
+            '--layer-size', str(layer_size),
+            '--batch-size', str(batch_size),
+            '--epochs', str(epochs),
+            '--seed', str(seed),
+            '--output-dir', str(model_dir),
+        ]
+        if balanced:
+            train_argv.append('--balanced')
+
+        sys.argv = train_argv
+        try:
+            metrics = train_main_fn()
+        finally:
+            sys.argv = original_argv
+
+        elapsed = time.time() - start_time
+
+        result_row.update({
+            'best_epoch': metrics.get('best_epoch', ''),
+            'best_val_auc': f"{metrics.get('best_auc', 0):.6f}",
+            'best_val_acc': f"{metrics.get('best_acc', 0):.6f}",
+            'final_val_loss': f"{metrics.get('final_val_loss', 0):.6f}",
+            'final_val_acc': f"{metrics.get('final_val_acc', 0):.6f}",
+            'final_val_auc': f"{metrics.get('final_val_auc', 0):.6f}",
+            'final_val_f1': f"{metrics.get('final_val_f1', 0):.6f}",
+            'elapsed_sec': f"{elapsed:.1f}",
+            'status': 'ok',
+        })
+
+        logger.info(f"✅ LAYER_SIZE={layer_size} 完成: "
+                     f"best_auc={metrics.get('best_auc', 0):.4f}, "
+                     f"best_acc={metrics.get('best_acc', 0):.4f}, "
+                     f"耗时 {elapsed:.1f}s")
+
+    except Exception as e:
+        elapsed = time.time() - start_time
+        result_row.update({
+            'best_epoch': '',
+            'best_val_auc': '',
+            'best_val_acc': '',
+            'final_val_loss': '',
+            'final_val_acc': '',
+            'final_val_auc': '',
+            'final_val_f1': '',
+            'elapsed_sec': f"{elapsed:.1f}",
+            'status': f'error: {str(e)[:200]}',
+        })
+        logger.error(f"❌ LAYER_SIZE={layer_size} 失败: {e}", exc_info=True)
+
+    return result_row
+
+
+def print_summary(csv_path: Path):
+    """打印已完成实验的汇总表"""
+    if not csv_path.exists():
+        logger.info("无已完成的实验结果")
+        return
+
+    logger.info(f"\n{'='*90}")
+    logger.info("  消融实验汇总")
+    logger.info(f"{'='*90}")
+    logger.info(f"{'Layer Size':>10} {'Best AUC':>10} {'Best Acc':>10} "
+                f"{'Final AUC':>10} {'Elapsed':>10} {'Status':>8}")
+    logger.info(f"{'-'*90}")
+
+    rows = []
+    with open(csv_path, 'r', newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append(row)
+
+    # 按 layer_size 排序
+    rows.sort(key=lambda r: int(r.get('layer_size', 0)))
+
+    best_auc_overall = -1.0
+    best_ls = None
+    for row in rows:
+        ls = row.get('layer_size', '?')
+        bauc = row.get('best_val_auc', '')
+        bacc = row.get('best_val_acc', '')
+        fauc = row.get('final_val_auc', '')
+        elapsed = row.get('elapsed_sec', '')
+        status = row.get('status', '')[:8]
+
+        logger.info(f"{ls:>10} {bauc:>10} {bacc:>10} {fauc:>10} {elapsed:>10} {status:>8}")
+
+        try:
+            auc_val = float(bauc)
+            if auc_val > best_auc_overall:
+                best_auc_overall = auc_val
+                best_ls = ls
+        except (ValueError, TypeError):
+            pass
+
+    logger.info(f"{'-'*90}")
+    if best_ls is not None:
+        logger.info(f"🏆 最佳 LAYER_SIZE = {best_ls} (best_val_auc = {best_auc_overall:.6f})")
+    logger.info(f"{'='*90}\n")
+
+
+def main():
+    p = argparse.ArgumentParser(description='LAYER_SIZE 消融实验',
+                                formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument('--sizes', nargs='+', type=int, default=DEFAULT_SIZES,
+                   help='要测试的 LAYER_SIZE 列表')
+    p.add_argument('--batch-size', type=int, default=256,
+                   help='训练 batch size (大 LAYER_SIZE 时建议调小)')
+    p.add_argument('--epochs', type=int, default=40,
+                   help='每个配置的训练轮数')
+    p.add_argument('--seed', type=int, default=42,
+                   help='随机种子')
+    p.add_argument('--balanced', action='store_true',
+                   help='启用类别平衡采样')
+    p.add_argument('--csv-path', type=Path, default=CSV_PATH,
+                   help='结果 CSV 路径')
+    p.add_argument('--dry-run', action='store_true',
+                   help='仅预览, 不实际训练')
+    p.add_argument('--rerun-failed', action='store_true',
+                   help='重新运行之前失败的配置')
+    args = p.parse_args()
+
+    ABLATION_ROOT.mkdir(parents=True, exist_ok=True)
+    args.csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 加载 train.py 的 main 函数
+    train_main_fn = load_train_main()
+
+    # 检查已完成的实验
+    completed = get_completed_sizes(args.csv_path)
+    if not args.rerun_failed:
+        # 也跳过 error 状态的 (除非 --rerun-failed)
+        skip_sizes = completed
+    else:
+        skip_sizes = set()
+
+    sizes_to_run = [s for s in args.sizes if s not in skip_sizes]
+
+    logger.info(f"LAYER_SIZE 消融实验")
+    logger.info(f"  待测配置: {args.sizes}")
+    logger.info(f"  已完成:   {sorted(completed)}")
+    logger.info(f"  本次运行: {sizes_to_run}")
+    logger.info(f"  Batch size: {args.batch_size}, Epochs: {args.epochs}")
+    logger.info(f"  CSV: {args.csv_path}")
+
+    if not sizes_to_run and not args.dry_run:
+        logger.info("所有配置已完成, 无需运行。使用 --rerun-failed 重跑失败的配置。")
+        print_summary(args.csv_path)
+        return
+
+    total_start = time.time()
+    for i, ls in enumerate(sizes_to_run):
+        logger.info(f"\n[{i+1}/{len(sizes_to_run)}] Processing LAYER_SIZE={ls}")
+        row = run_single_ablation(
+            train_main_fn=train_main_fn,
+            layer_size=ls,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            seed=args.seed,
+            balanced=args.balanced,
+            dry_run=args.dry_run,
+        )
+        # 每条完成后立即写入 CSV (防中断丢失)
+        append_csv_row(args.csv_path, row)
+
+    total_elapsed = time.time() - total_start
+    logger.info(f"\n消融实验总耗时: {total_elapsed:.1f}s")
+
+    # 打印汇总
+    print_summary(args.csv_path)
+
+
+if __name__ == '__main__':
+    main()

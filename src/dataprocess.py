@@ -4,11 +4,11 @@ src/dataprocess.py - 序列预处理与编码
 关键修复 (相对旧版):
 1. 字符串清洗正确赋值 (原版 seq.replace() 结果被丢弃)
 2. One-hot 编码向量化实现 (原版为纯 Python 循环, 慢 ~50 倍)
-3. parse_fasta_header 正确处理 '>SampleID|chr1:100-200|eccDNA' 格式
-   (原实现中 end 字段带 label 后缀导致 int() 失败, start/end 恒为 0)
+3. parse_fasta_header 正确处理 '>SampleID|chr1:100-200|eccDNA' 以及带浮点数格式如 '>chr13:52514242.0-52514642.0'
 4. 长度使用完整 len(seq) (原版 n=len-1 是 off-by-one bug)
 """
 import random
+import re
 import numpy as np
 
 from config import SEQUENCE_LENGTH
@@ -80,21 +80,13 @@ def encode_sequence(seq: str, length: int = SEQUENCE_LENGTH) -> np.ndarray:
 
 def parse_fasta_header(header: str) -> dict:
     """
-    解析 FASTA Header, 提取 ID / 染色体位置 / 标签
-
+    极度鲁棒的 FASTA Header 解析器。
+    
     支持格式:
       >SampleID|chr1:100-200|eccDNA      (process_data.py 生成的标准格式)
       >chr1:100-200                       (samtools 输出格式)
       >candidate_0_chr1:100-200           (cnvkit_pipeline 生成的格式)
-      >seq_name description text          (普通 FASTA)
-
-    返回 dict:
-      id: str            序列 ID
-      chrom: str         染色体名 (未解析到则为 '')
-      start: int         起始坐标 (未解析到则为 0)
-      end: int           终止坐标 (未解析到则为 0)
-      has_position: bool 是否成功解析到坐标
-      label: int|None    1=eccDNA, 0=otherDNA, None=未标注
+      >chr13:52514242.0-52514642.0        (带异常浮点数)
     """
     info = {"id": "", "chrom": "", "start": 0, "end": 0,
             "has_position": False, "label": None}
@@ -105,37 +97,22 @@ def parse_fasta_header(header: str) -> dict:
 
     segments = [s.strip() for s in h.split('|') if s.strip()]
 
-    # --- 解析位置: 在任意 segment 中找 'chrom:start-end' 模式 ---
+    # --- 解析位置: 完美兼容浮点数和小数点 .0 ---
     for seg in segments:
-        if ':' not in seg:
-            continue
-        chrom_part, pos_part = seg.split(':', 1)
-        # chrom_part 可能带前缀 (如 candidate_0_chr1), 取最后一段作为染色体名
-        # 但保留完整 seg 供上游按需使用
-        if '-' not in pos_part:
-            continue
-        start_str, end_str = pos_part.split('-', 1)
-        # end_str 可能带尾部杂质, 取第一个非数字前
-        end_clean = ''
-        for ch in end_str:
-            if ch.isdigit():
-                end_clean += ch
+        match = re.search(r"([^:|\s]+):(\d+)(?:\.\d+)?-(\d+)(?:\.\d+)?", seg)
+        if match:
+            chrom_part = match.group(1).strip()
+            # 若含 '_'，取最后一段 (candidate_0_chr1 -> chr1)
+            if '_' in chrom_part:
+                chrom_name = chrom_part.rsplit('_', 1)[-1]
             else:
-                break
-        try:
-            start_val = int(start_str)
-            end_val = int(end_clean) if end_clean else 0
-        except ValueError:
-            continue
-        # 染色体名: 若含 '_', 取最后一段 (candidate_0_chr1 -> chr1)
-        chrom_name = chrom_part.strip()
-        if '_' in chrom_name:
-            chrom_name = chrom_name.rsplit('_', 1)[-1]
-        info['chrom'] = chrom_name
-        info['start'] = start_val
-        info['end'] = end_val
-        info['has_position'] = True
-        break
+                chrom_name = chrom_part
+                
+            info['chrom'] = chrom_name
+            info['start'] = int(match.group(2))
+            info['end'] = int(match.group(3))
+            info['has_position'] = True
+            break
 
     # --- 解析标签 ---
     for seg in segments[1:] if len(segments) > 1 else []:

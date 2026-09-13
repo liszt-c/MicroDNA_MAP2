@@ -10,24 +10,15 @@ generate_microdna.py
 
 支持两种模式：
   1. 随机模式（默认）：从参考基因组随机选取区域作为 microDNA body。
-  2. 真实模式：指定 --input_fasta_dir 指向包含 .fa 文件的目录，
-     从这些文件中读取真实 microDNA 序列作为 body，并根据 FASTA
-     头部解析染色体位置。
+  2. 真实模式：指定 --input_fasta_dir 指向包含 .fa 文件的目录或特定的 .fa 文件，
+     从这些文件中读取真实 microDNA 序列作为 body。
+     *新增限制*: 若提供 --background_chroms，则仅使用来自指定背景染色体的真实序列。
 
 输出：
   - microdna_truth.bed
   - microdna_sequences.fa
   - microdna_circular_templates.fa
   - junction_info.tsv
-
-使用示例：
-  # 随机模式
-  python generate_microdna.py --genome_path hg19.fa --num_sites 100
-
-  # 真实模式
-  python generate_microdna.py --genome_path hg19.fa \
-      --input_fasta_dir ./datasets/eccDNA \
-      --num_sites 200
 """
 
 from __future__ import annotations
@@ -56,7 +47,6 @@ N_MAX_FRACTION = 0.10
 
 
 def load_yaml_config(config_path: Path) -> dict:
-    """读取 YAML 配置文件（如果存在）。"""
     if not config_path.exists():
         return {}
     try:
@@ -93,13 +83,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--flank", type=int, default=None,
                         help="Length of upstream/downstream flanking sequence (default: 50)")
     parser.add_argument("--input_fasta_dir", type=str, default=None,
-                        help="Directory containing real microDNA FASTA files. "
+                        help="Directory or File containing real microDNA FASTA sequences. "
                              "If provided, will use these sequences as microDNA bodies.")
+    parser.add_argument("--background_chroms", type=str, default=None,
+                        help="Comma-separated list of allowed chromosomes (e.g. chr21,chr22). "
+                             "Crucial for preventing WGS alignment to non-background chromosomes.")
     return parser.parse_args()
 
 
 def weighted_chromosome_choice(chroms: List[str], lengths: List[int]) -> Tuple[str, int]:
-    """按染色体长度加权随机选择一条染色体。"""
     total = sum(lengths)
     r = random.uniform(0, total)
     for chrom, length in zip(chroms, lengths):
@@ -110,14 +102,12 @@ def weighted_chromosome_choice(chroms: List[str], lengths: List[int]) -> Tuple[s
 
 
 def n_fraction(seq: str) -> float:
-    """计算序列中 N/n 的比例。"""
     if len(seq) == 0:
         return 1.0
     return (seq.count("N") + seq.count("n")) / len(seq)
 
 
 def load_gap_regions(gap_bed: Optional[str]) -> Dict[str, List[Tuple[int, int]]]:
-    """读取 gap BED 文件，返回 {chrom: [(start, end), ...]}。"""
     gaps: Dict[str, List[Tuple[int, int]]] = {}
     if not gap_bed:
         return gaps
@@ -142,7 +132,6 @@ def load_gap_regions(gap_bed: Optional[str]) -> Dict[str, List[Tuple[int, int]]]
 
 
 def overlaps_gap(chrom: str, start: int, end: int, gap_dict: Dict[str, List[Tuple[int, int]]]) -> bool:
-    """检查 [start, end) 是否与 gap 区域重叠。"""
     for g_start, g_end in gap_dict.get(chrom, []):
         if start < g_end and end > g_start:
             return True
@@ -150,7 +139,6 @@ def overlaps_gap(chrom: str, start: int, end: int, gap_dict: Dict[str, List[Tupl
 
 
 def write_fasta_record(f, header: str, sequence: str, line_width: int = 80) -> None:
-    """按固定行宽写入 FASTA 记录。"""
     f.write(f">{header}\n")
     for i in range(0, len(sequence), line_width):
         f.write(sequence[i:i + line_width] + "\n")
@@ -158,39 +146,37 @@ def write_fasta_record(f, header: str, sequence: str, line_width: int = 80) -> N
 
 def parse_fasta_header(header: str) -> Optional[Tuple[str, int, int]]:
     """
-    从 FASTA 头部解析染色体、起始和终止位置。
-    支持格式：
-        >chrY:601286.0-601686.0
-        >chr10:100980386-100980789
-    返回 (chrom, start, end) 或 None。
+    极度鲁棒的 FASTA 头部解析器。
+    完美处理浮点数问题，例如: >chr13:52514242.0-52514642.0
     """
     header = header.strip()
     if header.startswith(">"):
         header = header[1:]
-    match = re.match(r"([^:]+):(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)", header)
-    if not match:
-        return None
-    chrom = match.group(1).strip()
-    start_str = match.group(2).replace(".0", "").split(".")[0]
-    end_str = match.group(3).replace(".0", "").split(".")[0]
-    try:
-        start = int(start_str)
-        end = int(end_str)
-    except ValueError:
-        return None
-    if start < 0 or end <= start:
-        return None
-    return chrom, start, end
+    
+    # 忽略 | 分隔符后面的内容，直接找 chrom:start-end
+    for seg in header.split("|"):
+        # 匹配: 染色体名 + 冒号 + 数字(允许跟.0) + 连字符 + 数字(允许跟.0)
+        match = re.search(r"([a-zA-Z0-9_]+):(\d+)(?:\.\d+)?-(\d+)(?:\.\d+)?", seg)
+        if match:
+            chrom = match.group(1).strip()
+            start = int(match.group(2))
+            end = int(match.group(3))
+            
+            if start >= 0 and end > start:
+                return chrom, start, end
+    return None
 
 
-def read_real_microdna_fasta(input_dir: Path) -> List[Tuple[str, int, int, str]]:
-    """
-    读取目录下所有 .fa 文件，解析每条记录。
-    返回列表，每个元素为 (chrom, start, end, sequence)。
-    忽略无法解析位置信息的记录。
-    """
+def read_real_microdna_fasta(input_path: Path, allowed_chroms: Optional[set] = None) -> List[Tuple[str, int, int, str]]:
     records = []
-    for fa_file in input_dir.glob("*.fa"):
+    
+    # 修复：同时支持传入文件目录和单个文件
+    if input_path.is_dir():
+        fa_files = list(input_path.glob("*.fa")) + list(input_path.glob("*.fasta"))
+    else:
+        fa_files = [input_path]
+        
+    for fa_file in fa_files:
         with open(fa_file, "r", encoding="utf-8") as f:
             current_header = None
             current_seq = []
@@ -204,7 +190,8 @@ def read_real_microdna_fasta(input_dir: Path) -> List[Tuple[str, int, int, str]]
                         loc = parse_fasta_header(current_header)
                         if loc is not None:
                             chrom, start, end = loc
-                            records.append((chrom, start, end, seq))
+                            if allowed_chroms is None or chrom in allowed_chroms:
+                                records.append((chrom, start, end, seq))
                     current_header = line
                     current_seq = []
                 else:
@@ -216,7 +203,8 @@ def read_real_microdna_fasta(input_dir: Path) -> List[Tuple[str, int, int, str]]
                 loc = parse_fasta_header(current_header)
                 if loc is not None:
                     chrom, start, end = loc
-                    records.append((chrom, start, end, seq))
+                    if allowed_chroms is None or chrom in allowed_chroms:
+                        records.append((chrom, start, end, seq))
     return records
 
 
@@ -229,14 +217,13 @@ def generate_from_real_fasta(
     seed: int,
     gap_dict: Dict[str, List[Tuple[int, int]]],
 ) -> None:
-    """从真实 microDNA 序列生成 truth 文件。"""
     random.seed(seed)
 
     if len(records) > num_sites:
         selected = random.sample(records, num_sites)
     else:
         selected = records
-        print(f"[WARN] 真实 microDNA 记录数 ({len(records)}) 少于目标数量 ({num_sites})，将使用全部记录。")
+        print(f"[WARN] 符合条件的真实 microDNA 记录数 ({len(records)}) 少于目标数量 ({num_sites})，将使用全部记录。")
 
     truth_bed = output_dir / "microdna_truth.bed"
     truth_fasta = output_dir / "microdna_sequences.fa"
@@ -251,10 +238,9 @@ def generate_from_real_fasta(
         junc_f.write("id\tchr\tjunction_pos\tbody_start\tbody_end\n")
 
         for idx, (chrom, orig_start, orig_end, body_seq) in enumerate(selected):
-            # 使用实际序列长度作为 body_len
             body_len = len(body_seq)
             start = orig_start
-            end = start + body_len  # 调整坐标以匹配序列长度
+            end = start + body_len
 
             if body_len <= 0:
                 continue
@@ -262,7 +248,6 @@ def generate_from_real_fasta(
             if gap_dict and overlaps_gap(chrom, start, end, gap_dict):
                 continue
 
-            # 提取侧翼序列
             try:
                 upstream = fasta.fetch(chrom, max(0, start - flank), start).upper()
             except Exception:
@@ -272,7 +257,6 @@ def generate_from_real_fasta(
             except Exception:
                 downstream = ""
 
-            # 补齐侧翼
             if len(upstream) < flank:
                 upstream = "N" * (flank - len(upstream)) + upstream
             if len(downstream) < flank:
@@ -304,7 +288,6 @@ def generate_random(
     gap_dict: Dict[str, List[Tuple[int, int]]],
     output_dir: Path,
 ) -> None:
-    """从参考基因组随机生成 microDNA truth。"""
     random.seed(seed)
 
     truth_bed = output_dir / "microdna_truth.bed"
@@ -419,16 +402,22 @@ def main() -> None:
 
     gap_dict = load_gap_regions(gap_bed)
 
+    # 确定允许的染色体列表
+    allowed_chroms = None
+    if args.background_chroms:
+        allowed_chroms = set(c.strip() for c in args.background_chroms.split(",") if c.strip())
+        print(f"[INFO] 限制 microDNA 提取来源为以下染色体: {allowed_chroms}")
+
     if args.input_fasta_dir:
-        input_dir = Path(args.input_fasta_dir)
-        if not input_dir.is_dir():
-            print(f"[ERROR] 指定的真实 FASTA 目录不存在: {input_dir}", file=sys.stderr)
+        input_path = Path(args.input_fasta_dir)
+        if not input_path.exists():
+            print(f"[ERROR] 指定的真实 FASTA 输入不存在: {input_path}", file=sys.stderr)
             sys.exit(1)
-        print(f"[INFO] 从真实 microDNA FASTA 读取序列: {input_dir}")
-        records = read_real_microdna_fasta(input_dir)
+        print(f"[INFO] 从真实 microDNA FASTA 读取序列: {input_path}")
+        records = read_real_microdna_fasta(input_path, allowed_chroms)
         print(f"[INFO] 读取到 {len(records)} 条可用的真实序列")
         if len(records) == 0:
-            print("[ERROR] 未读取到任何有效的 microDNA 序列，请检查 FASTA 头部格式。", file=sys.stderr)
+            print("[ERROR] 未读取到有效序列。如果使用了 quick 模式，请确保原始数据中包含背景染色体的序列。", file=sys.stderr)
             sys.exit(1)
 
         generate_from_real_fasta(
@@ -442,10 +431,15 @@ def main() -> None:
         )
     else:
         print(f"[INFO] 随机模式：从参考基因组选取 microDNA 位点")
-        allowed_chroms = [f"chr{i}" for i in range(1, 23)] + ["chrX", "chrY"]
-        chroms = [c for c in fasta.references if c in allowed_chroms]
+        # 如果提供了 background_chroms，则从中抽取；否则用主染色体
+        if allowed_chroms:
+            chroms = [c for c in fasta.references if c in allowed_chroms]
+        else:
+            default_chroms = [f"chr{i}" for i in range(1, 23)] + ["chrX", "chrY"]
+            chroms = [c for c in fasta.references if c in default_chroms]
+            
         if not chroms:
-            print("[ERROR] 参考基因组中未找到主染色体。", file=sys.stderr)
+            print("[ERROR] 参考基因组中未找到指定的染色体。", file=sys.stderr)
             sys.exit(1)
         lengths = [fasta.get_reference_length(c) for c in chroms]
 
