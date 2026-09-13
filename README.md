@@ -183,7 +183,7 @@ python benchmark/models_comparison/train_eval.py --model resnet50 --epochs 30
 # 训练并评估无注意力机制的 ResNet (Ablation)
 python benchmark/models_comparison/train_eval.py --model resnet_no_att --epochs 30
 
-# 训练并评估 Transformer 架构 (在 SI 补充材料中论证其在序列数据上的局限性)
+# 训练并评估 Transformer 架构
 python benchmark/models_comparison/train_eval.py --model transformer --epochs 30
 ```
 
