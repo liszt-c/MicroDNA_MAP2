@@ -173,11 +173,17 @@ python scripts/batch_process.py --input-dir data/raw --threads 16 --cleanup
 
 ```
 
-**全流程运作机制:**
+---
+### 6. 模型架构消融与对比基准
 
-1. **比对**: Bowtie2 执行 paired-end 映射生成 BAM。
-2. **CNV Call**: CNVkit (`batch` + `call`) 划定基因组显著变化区间。
-3. **坐标映射**: 利用 samtools 精确定位提取潜在变异序列至临时 FASTA。
-4. **神经网络筛选**: 启动长序列滑窗模型，在高维特征层面判定是否符合 eccDNA 的构造特征。
-5. **结果落盘**: `results/predictions/` 内输出高纯度的靶向区域清单 (.bed / .fasta)。
+```bash
+# 训练并评估标准 ResNet50 基线
+python benchmark/models_comparison/train_eval.py --model resnet50 --epochs 30
+
+# 训练并评估无注意力机制的 ResNet (Ablation)
+python benchmark/models_comparison/train_eval.py --model resnet_no_att --epochs 30
+
+# 训练并评估 Transformer 架构 (在 SI 补充材料中论证其在序列数据上的局限性)
+python benchmark/models_comparison/train_eval.py --model transformer --epochs 30
+```
 
