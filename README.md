@@ -1,7 +1,6 @@
 # MicroDNA Map v2.0
 
 基于 ResNet-SelfAttention 架构的 eccDNA (MicroDNA) 识别与分析平台。
-本项目提供了统一的配置管理、惰性数据加载机制、标准化的训练与推理接口，并深度集成了从测序原始数据(FASTQ)到变异提取(CNVkit)再到深度学习识别的端到端管线。特别引入了**双重负例挖掘（Offline & Multi-round Online HNM）**机制以有效抑制预测时的假阳性“拖尾”现象。
 
 ## 项目结构
 
@@ -68,8 +67,6 @@ pip install seaborn cnvkit
 
 ### 1. 数据准备与双重负例挖掘
 
-为了彻底压制模型推断时的假阳性“拖尾”问题，本项目在数据层面实施两步走的负例挖掘策略：一是离线的海量背景覆盖，二是在线的高效动态剔除。
-
 #### 1.1 提取确切标注序列 (`process_data.py`)
 
 提取 Excel 中的 eccDNA (正例) 与明确的 otherDNA (负例)。
@@ -97,11 +94,11 @@ python scripts/sample_negatives.py --ratio 1.5 --ref refs/hg19.fa
 
 ### 2. 模型训练与多阶段困难负例挖掘 (Multi-round HNM)
 
-在实际训练中，我们采用**多阶段级联挖掘策略**：首先进行 Base 训练（如 30 个 Epoch）；随后每进入一个新挖掘阶段，模型会自动加载前一阶段的 Best 模型权重，筛选出迷惑性最大的困难负例，并重置优化器再训练 20 个 Epoch。这种机制确保了模型能够逐层逼近最精确的分类边界。
+在实际训练中，我们采用**多阶段级联挖掘策略**：首先进行 Base 训练（如 20 个 Epoch）；随后每进入一个新挖掘阶段，模型会自动加载前一阶段的 Best 模型权重，筛选出迷惑性最大的困难负例，并重置优化器再训练 15 个 Epoch。这种机制确保了模型能够逐层逼近最精确的分类边界。
 
 ```bash
-# 基础训练 30 个 Epoch，再进行 1 轮 HNM（附加 20 个 Epoch），总计 50 Epoch
-python scripts/train.py --base-epochs 30 --hnm-rounds 1 --hnm-epochs 20 --batch-size 256 --balanced
+# 基础训练 20 个 Epoch，再进行 3 轮 HNM（附加 15 个 Epoch），总计 65 Epoch
+python scripts/train.py --base-epochs 20 --hnm-rounds 3 --hnm-epochs 15 --batch-size 256 --balanced
 
 ```
 
