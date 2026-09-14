@@ -1,6 +1,6 @@
 # MicroDNA Map v2.0
 
-基于 ResNet-SelfAttention 与双层滑动窗口架构的 eccDNA 识别与分析平台。
+基于 ResNet-SelfAttention 与双层滑动窗口架构的 eccDNA (MicroDNA) 识别与分析平台。
 
 ## 项目结构
 
@@ -91,7 +91,7 @@ python scripts/predict.py --input data/test_long.fa --mode long --limit 0.75
 
 * `--input-dir` FASTQ 文件所在目录。
 * `--threads` 运行线程数。
-* `--limit` 深度学习最终筛选阈值，默认 0.75。
+* `--limit` 识别阈值，默认 0.75。
 * `--min-log2` CNVkit 过滤阈值。
 * `--min-cnv-size` 与 `--max-cnv-size` 变异片段长度过滤限制。
 * `--cleanup` 运行完成后删除生成的 BAM 等中间文件。
