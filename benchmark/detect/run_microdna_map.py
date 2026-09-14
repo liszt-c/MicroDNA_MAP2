@@ -8,15 +8,10 @@ run_microdna_map.py
 
 流程:
   1. Bowtie2 比对 + samtools sort/index
-  2. CNVkit batch + segment + call
+  2. CNVkit batch + segment + call (引入动态基线裁剪，修复全局中位数偏移导致的假阳性)
   3. 从 .call.cns 提取候选 CNV 区域序列 (合并 FASTA)
   4. 调用 scripts/predict.py --mode long 进行滑窗预测
   5. 合并输出标准 BED
-
-适配 MicroDNA Map v2.0 重构后的接口:
-  - 使用 scripts/predict.py 替代已废弃的 run.py
-  - 支持任意模型路径 (不再要求放在 save/ 目录)
-  - 自动处理 eccDNA=class0 旧版权重 (6.pth)
 """
 
 from __future__ import annotations
@@ -27,7 +22,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 BENCHMARK_DIR = Path(__file__).resolve().parents[1]
@@ -73,6 +68,39 @@ def index_bam(bam_path: Path, threads: int) -> None:
     run_cmd(["samtools", "index", "-@", str(threads), str(bam_path)], check=True)
 
 
+def create_sub_reference(orig_cnn: Path, allowed_chroms: set, output_dir: Path) -> Path:
+    """
+    [核心修复] 动态裁剪 CNVkit Reference (.cnn)。
+    如果 WGS 只模拟了 chr1-5，直接使用全基因组的 .cnn 会导致 CNVkit 的全局中位数计算完全崩盘
+    （80% 无覆盖区域将中位数拉向极负，导致 chr1-5 的正常 30x 背景被错误地评估为染色体级别的巨大扩增）。
+    通过丢弃未测序的染色体，让 CNVkit 只在局部“世界观”里计算，从而恢复绝对精准的拷贝数计算。
+    """
+    sub_cnn_path = output_dir / f"sub_reference.cnn"
+    if not orig_cnn.exists():
+        raise FileNotFoundError(f"Original .cnn not found: {orig_cnn}")
+        
+    print(f"[INFO] 正在裁剪 CNVkit 参考基线以匹配局部 WGS 模拟 (保留染色体: {allowed_chroms})...")
+    with open(orig_cnn, 'r', encoding='utf-8') as fin, \
+         open(sub_cnn_path, 'w', encoding='utf-8') as fout:
+        # 读取并写入表头
+        header = fin.readline()
+        fout.write(header)
+        
+        # 假设第一列通常是 chromosome，解析列索引
+        h_parts = header.strip().split('\t')
+        chrom_idx = h_parts.index("chromosome") if "chromosome" in h_parts else 0
+        
+        kept = 0
+        for line in fin:
+            parts = line.strip().split('\t')
+            if len(parts) > chrom_idx and parts[chrom_idx] in allowed_chroms:
+                fout.write(line)
+                kept += 1
+                
+    print(f"[INFO] 基线裁剪完成，保留了 {kept} 个 Reference Bins -> {sub_cnn_path.name}")
+    return sub_cnn_path
+
+
 def run_cnvkit(bam_path: Path, cnvkit_reference: Path, output_dir: Path, threads: int) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     run_cmd(["cnvkit.py", "batch", "-m", "wgs", "-r", str(cnvkit_reference),
@@ -93,11 +121,10 @@ def run_cnvkit(bam_path: Path, cnvkit_reference: Path, output_dir: Path, threads
 
 
 def extract_cnv_regions_fasta(cnv_call_file: Path, reference_fasta: Path,
-                              output_fa: Path, min_length: int = 200) -> int:
+                              output_fa: Path, min_length: int = 200, allowed_chroms: set = None) -> int:
     """
     从 .call.cns 提取候选区域序列, 写入单个合并 FASTA。
-    Header 包含染色体坐标以便 predict.py 解析绝对位置。
-    返回写入的序列数。
+    加入 allowed_chroms 过滤，作为双重保险，阻断一切错配产生的漏网之鱼。
     """
     output_fa.parent.mkdir(parents=True, exist_ok=True)
 
@@ -126,7 +153,13 @@ def extract_cnv_regions_fasta(cnv_call_file: Path, reference_fasta: Path,
             parts = line.split("\t")
             if len(parts) <= max(chrom_idx, start_idx, end_idx):
                 continue
+            
             chrom = parts[chrom_idx]
+            
+            # === 基于预设背景染色体的过滤 ===
+            if allowed_chroms is not None and chrom not in allowed_chroms:
+                continue
+
             try:
                 start, end = int(parts[start_idx]), int(parts[end_idx])
             except ValueError:
@@ -155,10 +188,6 @@ def extract_cnv_regions_fasta(cnv_call_file: Path, reference_fasta: Path,
 
 def run_microdna_predict(input_fa: Path, model_path: Path, limit: str,
                          output_dir: Path) -> Optional[Path]:
-    """
-    调用 scripts/predict.py --mode long 进行滑窗预测。
-    返回生成的 BED 文件路径, 若无结果则返回 None。
-    """
     predict_script = PROJECT_ROOT / "scripts" / "predict.py"
     if not predict_script.exists():
         raise FileNotFoundError(f"找不到 predict.py: {predict_script}")
@@ -185,13 +214,11 @@ def run_microdna_predict(input_fa: Path, model_path: Path, limit: str,
 
     print(f"[INFO] MicroDNA Map 预测完成, 耗时 {elapsed:.2f}s")
 
-    # predict.py 输出: {stem}.bed
     bed_files = list(predict_output.glob("*.bed"))
     if not bed_files:
         print("[WARN] predict.py 未生成任何 BED 文件")
         return None
 
-    # 如果有多个 BED (多序列输入), 合并为一个
     if len(bed_files) == 1:
         return bed_files[0]
 
@@ -204,7 +231,6 @@ def run_microdna_predict(input_fa: Path, model_path: Path, limit: str,
 
 
 def merge_bed_to_standard(input_bed: Path, output_bed: Path) -> int:
-    """将 predict.py 输出的 BED 转为 benchmark 标准格式 (5列)。"""
     output_bed.parent.mkdir(parents=True, exist_ok=True)
     count = 0
     with open(output_bed, "w") as fout:
@@ -224,7 +250,8 @@ def merge_bed_to_standard(input_bed: Path, output_bed: Path) -> int:
 
 def run_microdna_map(r1: Path, r2: Path, reference: Path, output_dir: Path,
                      model_path: Path = DEFAULT_MODEL_PATH, limit: str = DEFAULT_LIMIT,
-                     threads: int = DEFAULT_THREADS, cnvkit_reference: Optional[Path] = None) -> Path:
+                     threads: int = DEFAULT_THREADS, cnvkit_reference: Optional[Path] = None,
+                     allowed_chroms: set = None) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     log_file = output_dir / "microdna_map.log"
     total_start = time.time()
@@ -238,19 +265,25 @@ def run_microdna_map(r1: Path, r2: Path, reference: Path, output_dir: Path,
     align_and_sort_reads(r1, r2, ref_prefix, bam_path, threads)
     index_bam(bam_path, threads)
 
-    # 2. CNVkit
+    # 2. 智能截取 CNVkit 基线模型
+    cnvkit_dir = output_dir / "cnvkit"
+    cnvkit_dir.mkdir(parents=True, exist_ok=True)
+    
     if cnvkit_reference is None:
         cnvkit_reference = PROJECT_ROOT / "refs" / "cnvkit_ref.cnn"
         if not cnvkit_reference.exists():
-            raise FileNotFoundError(
-                f"未提供 CNVkit 参考文件, 且默认路径不存在: {cnvkit_reference}")
+            raise FileNotFoundError(f"未提供 CNVkit 参考文件: {cnvkit_reference}")
+            
+    # 【核心防御逻辑】：如果指定了部分染色体，则缩减基线以避免全局中位数漂移
+    active_reference = cnvkit_reference
+    if allowed_chroms is not None and len(allowed_chroms) > 0:
+        active_reference = create_sub_reference(cnvkit_reference, allowed_chroms, cnvkit_dir)
 
-    cnvkit_dir = output_dir / "cnvkit"
-    result_call = run_cnvkit(bam_path, cnvkit_reference, cnvkit_dir, threads)
+    result_call = run_cnvkit(bam_path, active_reference, cnvkit_dir, threads)
 
     # 3. 提取候选区域序列 (合并 FASTA)
     candidates_fa = output_dir / "cnv_candidates.fa"
-    n_extracted = extract_cnv_regions_fasta(result_call, reference, candidates_fa)
+    n_extracted = extract_cnv_regions_fasta(result_call, reference, candidates_fa, allowed_chroms=allowed_chroms)
 
     final_bed = output_dir / "detected_microdna.bed"
     if n_extracted == 0:
@@ -283,6 +316,7 @@ def main() -> None:
     parser.add_argument("--limit", type=str, default=DEFAULT_LIMIT)
     parser.add_argument("--threads", type=int, default=DEFAULT_THREADS)
     parser.add_argument("--cnvkit_reference", type=Path, default=None)
+    parser.add_argument("--allowed_chroms", type=str, default=None, help="逗号分隔的合法染色体列表")
     args = parser.parse_args()
 
     for tool in ["bowtie2", "samtools", "cnvkit.py"]:
@@ -298,10 +332,12 @@ def main() -> None:
         print(f"[ERROR] 模型文件不存在: {args.model_path}", file=sys.stderr)
         sys.exit(1)
 
+    allowed_chroms = set(c.strip() for c in args.allowed_chroms.split(",")) if args.allowed_chroms else None
+
     try:
         bed = run_microdna_map(args.r1, args.r2, args.reference, args.output_dir,
                                args.model_path, args.limit, args.threads,
-                               args.cnvkit_reference)
+                               args.cnvkit_reference, allowed_chroms)
         print(f"[INFO] 检测完成, BED: {bed}")
     except Exception as e:
         print(f"[ERROR] {e}", file=sys.stderr)

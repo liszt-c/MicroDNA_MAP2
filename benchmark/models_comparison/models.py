@@ -4,9 +4,9 @@
 benchmark/models_comparison/models.py
 
 包含论文 3.1 节用于对比测试的模型架构:
-1. ResNet50: 标准的 ResNet50 一维版本
+1. ResNet50: 采用经典的“Half-Width”半宽配置，参数量约 6M，作为强有力的基线对比
 2. ResNetNoAttention: 剔除了 Conv-SA 的基础模型 (Ablation)
-3. TransformerClassifier: 纯 Transformer 模型
+3. TransformerClassifier: 采用 embed_dim=256, depth=8，参数量约 6.3M，与 ResNet50 基线对齐
 """
 
 import torch
@@ -15,7 +15,7 @@ import torch.nn.functional as F
 
 from src.model import BasicBlock
 
-# --- 1. ResNet50 ---
+# --- 1. ResNet50 (Half-Width版，参数量约 6M) ---
 class Bottleneck(nn.Module):
     def __init__(self, In_channel, Med_channel, Out_channel, downsample=False):
         super(Bottleneck, self).__init__()
@@ -50,36 +50,38 @@ class Bottleneck(nn.Module):
 class ResNet50(nn.Module):
     def __init__(self, in_channels=4, classes=2):
         super(ResNet50, self).__init__()
+        # Half-Width ResNet50配置: 通道减半，但保留完整 50 层深度。
+        # 既保证了强大的特征提取能力，又将参数量控制在合理的 ~6M 级别。
         self.features = nn.Sequential(
-            nn.Conv1d(in_channels, 512, kernel_size=7, stride=2, padding=3, bias=False),
-            nn.BatchNorm1d(512),
+            nn.Conv1d(in_channels, 32, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.BatchNorm1d(32),
             nn.ReLU(inplace=True),
             nn.MaxPool1d(3, 2, 1),
             
+            Bottleneck(32, 32, 128, True),
+            Bottleneck(128, 32, 128, False),
+            Bottleneck(128, 32, 128, False),
+
+            Bottleneck(128, 64, 256, True),
+            Bottleneck(256, 64, 256, False),
+            Bottleneck(256, 64, 256, False),
+            Bottleneck(256, 64, 256, False),
+
+            Bottleneck(256, 128, 512, True),
+            Bottleneck(512, 128, 512, False),
+            Bottleneck(512, 128, 512, False),
+            Bottleneck(512, 128, 512, False),
+            Bottleneck(512, 128, 512, False),
+            Bottleneck(512, 128, 512, False),
+                        
             Bottleneck(512, 256, 1024, True),
             Bottleneck(1024, 256, 1024, False),
             Bottleneck(1024, 256, 1024, False),
 
-            Bottleneck(1024, 512, 2048, True),
-            Bottleneck(2048, 512, 2048, False),
-            Bottleneck(2048, 512, 2048, False),
-            Bottleneck(2048, 512, 2048, False),
-
-            Bottleneck(2048, 1024, 4096, True),
-            Bottleneck(4096, 1024, 4096, False),
-            Bottleneck(4096, 1024, 4096, False),
-            Bottleneck(4096, 1024, 4096, False),
-            Bottleneck(4096, 1024, 4096, False),
-            Bottleneck(4096, 1024, 4096, False),
-                        
-            Bottleneck(4096, 2048, 8192, True),
-            Bottleneck(8192, 2048, 8192, False),
-            Bottleneck(8192, 2048, 8192, False),
-
             nn.AdaptiveAvgPool1d(1)
         )
         self.classifier = nn.Sequential(
-            nn.Linear(8192, classes)
+            nn.Linear(1024, classes)
         )
 
     def forward(self, x):
@@ -164,8 +166,9 @@ class TransformerBlock(nn.Module):
         return out
 
 class TransformerClassifier(nn.Module):
-    def __init__(self, num_tokens=4, num_classes=2, embedding_dim=96, 
-                 transformer_depth=24, heads=24, dropout=0.5):
+    # 提升容量至强基线: embed=256, depth=8, heads=8。总参数量约 6.3M，对齐 ResNet50
+    def __init__(self, num_tokens=4, num_classes=2, embedding_dim=256, 
+                 transformer_depth=8, heads=8, dropout=0.3):
         super(TransformerClassifier, self).__init__()
         self.token_embedding = nn.Embedding(num_tokens, embedding_dim)
         self.transformer_blocks = nn.Sequential(

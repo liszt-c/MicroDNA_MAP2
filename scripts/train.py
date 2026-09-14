@@ -1,7 +1,8 @@
 """
 scripts/train.py - 模型训练入口
 
-集成了多阶段在线困难负例挖掘 (Multi-round Online Hard Negative Mining) 机制。
+集成了多阶段在线困难负例挖掘 (Multi-round Online Hard Negative Mining) 机制，
+并加入了自适应 AMP (Automatic Mixed Precision) 加速逻辑（保护 P40，加速 V100）。
 逻辑：
   1. Base Stage: 训练 base-epochs 轮次，产出初步的最佳模型。
   2. HNM Stages: 进行 hnm-rounds 轮。每轮开始前，加载上一阶段的 best_model.pth，
@@ -17,6 +18,7 @@ import torch
 from sklearn.metrics import roc_auc_score, accuracy_score, f1_score
 from torch.optim import lr_scheduler
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
@@ -47,6 +49,7 @@ def evaluate(model, loader, criterion, device, flooding_b: float):
     total_loss, n_batches, n_samples = 0.0, 0, 0
     all_probs, all_labels, all_preds = [], [], []
 
+    # 评估时为了保证最高精度，一般不用 AMP，保持全精度推理
     with torch.no_grad():
         for inputs, labels in loader:
             inputs = inputs.to(device, non_blocking=True)
@@ -119,9 +122,19 @@ def main():
     writer = SummaryWriter(log_dir=str(out_dir / 'logs'))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Device: {device} | seed={args.seed} | base_epochs={args.base_epochs} | "
-                f"hnm_rounds={args.hnm_rounds} | hnm_epochs={args.hnm_epochs} | "
-                f"bs={args.batch_size} | lr={args.lr} | layer_size={args.layer_size}")
+    
+    # === 智能 AMP 检测机制 ===
+    if torch.cuda.is_available():
+        gpu_cap = torch.cuda.get_device_capability()
+        use_amp = (gpu_cap[0] >= 7)
+    else:
+        use_amp = False
+        
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    logger.info(f"Device: {device} | AMP Enabled: {use_amp} (Auto-detected) | seed={args.seed}")
+    logger.info(f"Params: base_epochs={args.base_epochs} | hnm_rounds={args.hnm_rounds} | "
+                f"hnm_epochs={args.hnm_epochs} | bs={args.batch_size} | lr={args.lr} | layer_size={args.layer_size}")
 
     ecc_fa = Path(args.ecc_fa) if args.ecc_fa else PROCESSED_DATA_DIR / "eccDNA.fa"
     other_fa = Path(args.other_fa) if args.other_fa else PROCESSED_DATA_DIR / "otherDNA.fa"
@@ -175,7 +188,6 @@ def main():
             )
 
         # 每个阶段开始时，重新初始化优化器和调度器
-        # 原因：HNM 彻底改变了 Loss 景观，网络需要原始的学习率动力来调整分类边界
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         scheduler = lr_scheduler.StepLR(optimizer, step_size=args.step_size, gamma=args.gamma) \
             if args.step_size > 0 else None
@@ -185,28 +197,43 @@ def main():
             model.train()
             running_loss, correct, total = 0.0, 0, 0
 
-            for inputs, labels in train_loader:
+            # 引入 tqdm 进度条，leave=False 确保进度条在跑完一轮后消失，避免刷屏
+            pbar = tqdm(train_loader, desc=f"[{stage_name}] Epoch {epoch}/{epochs_for_stage}", leave=False)
+            
+            for inputs, labels in pbar:
                 inputs = inputs.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True)
 
                 optimizer.zero_grad(set_to_none=True)
-                outputs = model(inputs)
-                loss = criterion(outputs, labels)
-                raw_loss = float(loss.item())
+                
+                # --- AMP 前向传播 ---
+                with torch.cuda.amp.autocast(enabled=use_amp):
+                    outputs = model(inputs)
+                    loss = criterion(outputs, labels)
+                    raw_loss = float(loss.item())
 
-                if args.flooding_b > 0:
-                    loss = (loss - args.flooding_b).abs() + args.flooding_b
+                    if args.flooding_b > 0:
+                        loss = (loss - args.flooding_b).abs() + args.flooding_b
 
-                loss.backward()
-                optimizer.step()
+                # --- AMP 梯度缩放与反向传播 ---
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
 
                 running_loss += raw_loss
                 total += labels.size(0)
-                correct += int((outputs.argmax(1) == labels).sum().item())
+                batch_correct = int((outputs.float().argmax(1) == labels).sum().item())
+                correct += batch_correct
 
                 global_step += 1
                 if global_step % 100 == 0:
                     writer.add_scalar('Loss/train_step', raw_loss, global_step)
+
+                # 实时更新进度条后缀
+                pbar.set_postfix({
+                    'loss': f"{raw_loss:.4f}",
+                    'acc': f"{batch_correct / labels.size(0):.4f}"
+                })
 
             if scheduler is not None:
                 scheduler.step()
@@ -233,7 +260,7 @@ def main():
                         'layer_size': args.layer_size},
                        out_dir / "last_model.pth")
 
-            # 跨阶段维护全局最优指标，保证最终输出的始终是在恒定验证集上最好的模型
+            # 跨阶段维护全局最优指标
             score = vm['auc'] if vm['auc'] > 0 else vm['acc']
             if score > best_auc_overall:
                 best_auc_overall = score

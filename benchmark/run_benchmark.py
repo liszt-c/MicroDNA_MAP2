@@ -223,6 +223,13 @@ def phase5_microdna_wgs(config: dict, dry_run: bool = False) -> int:
     model = config["detection"]["microdna_map_model"]
     limit = config["detection"]["microdna_map_limit"]
     cnvkit_ref = config["genome"].get("cnvkit_reference")
+    
+    # 提取预设的合法背景染色体
+    if config.get("quick", False):
+        allowed_chroms = ",".join(config["genome"]["quick_chromosomes"])
+    else:
+        allowed_chroms = ",".join(config["genome"]["background_chroms"])
+
     for cn in config["simulation"]["copy_numbers"]:
         r1 = wgs_dir / f"cn{cn}" / f"wgs_{cn}x_R1.fastq"
         r2 = wgs_dir / f"cn{cn}" / f"wgs_{cn}x_R2.fastq"
@@ -230,12 +237,16 @@ def phase5_microdna_wgs(config: dict, dry_run: bool = False) -> int:
             continue
         out_dir = out_base / f"cn{cn}"
         out_dir.mkdir(parents=True, exist_ok=True)
+        
         cmd = [sys.executable, str(script), "--r1", str(r1), "--r2", str(r2),
                "--reference", str(config["genome"]["reference"]),
                "--output_dir", str(out_dir), "--model_path", str(model),
-               "--limit", str(limit), "--threads", str(threads)]
+               "--limit", str(limit), "--threads", str(threads),
+               "--allowed_chroms", allowed_chroms]  # 增加过滤参数
+        
         if cnvkit_ref and Path(cnvkit_ref).exists():
             cmd += ["--cnvkit_reference", str(cnvkit_ref)]
+            
         if run_cmd(cmd, dry_run=dry_run, cwd=PROJECT_ROOT) != 0:
             return 1
     return 0

@@ -5,6 +5,7 @@ benchmark/models_comparison/train_eval.py
 
 用于统一训练和评估论文 3.1 节中的对比模型。
 强制复用 src.dataloader 以确保同环境对比公平性。
+加入了自适应 AMP (Automatic Mixed Precision) 加速逻辑。
 """
 
 import argparse
@@ -15,6 +16,7 @@ import numpy as np
 import pandas as pd
 import torch
 from sklearn.metrics import roc_auc_score, accuracy_score, f1_score
+from tqdm import tqdm
 
 # 将项目根目录加入环境变量以导入核心模块
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -29,6 +31,7 @@ logger = setup_logger('models_comparison')
 
 
 def evaluate(model, loader, device):
+    """验证阶段保持全精度 (FP32) 推理，以获得最准确的指标评估"""
     model.eval()
     all_probs, all_labels, all_preds = [], [], []
 
@@ -68,6 +71,16 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
+    # === 智能 AMP 检测机制 ===
+    # 保护旧架构(如 P40/P100)，在 Volta(V100) 及以上架构自动开启 Tensor Core 加速
+    if torch.cuda.is_available():
+        gpu_cap = torch.cuda.get_device_capability()
+        use_amp = (gpu_cap[0] >= 7)
+    else:
+        use_amp = False
+        
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    
     # 强制固定种子以保证严格公平的对比环境
     torch.manual_seed(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
@@ -97,18 +110,32 @@ def main():
     criterion = torch.nn.CrossEntropyLoss().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-3)
     
-    logger.info(f"Starting training for {args.model} on {device}")
+    logger.info(f"Starting training for {args.model} on {device} | AMP Enabled: {use_amp}")
     
     best_metrics = {'epoch': 0, 'acc': 0, 'auc': 0, 'f1': 0}
 
     for epoch in range(1, args.epochs + 1):
         model.train()
-        for inputs, labels in train_loader:
+        
+        # 加入 tqdm 进度条，设置 leave=False 使其结束后自动清除，不扰乱 log 记录
+        pbar = tqdm(train_loader, desc=f"{args.model.upper()} Epoch [{epoch}/{args.epochs}]", leave=False)
+        
+        for inputs, labels in pbar:
             inputs, labels = inputs.to(device), labels.to(device)
             optimizer.zero_grad()
-            loss = criterion(model(inputs), labels)
-            loss.backward()
-            optimizer.step()
+            
+            # --- AMP 前向传播 ---
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+            
+            # --- AMP 梯度缩放与反向传播 ---
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            # 实时更新进度条后缀
+            pbar.set_postfix({'loss': f"{loss.item():.4f}"})
 
         metrics = evaluate(model, val_loader, device)
         logger.info(f"Epoch [{epoch}/{args.epochs}] - ACC: {metrics['acc']:.4f}, AUC: {metrics['auc']:.4f}, F1: {metrics['f1']:.4f}")
