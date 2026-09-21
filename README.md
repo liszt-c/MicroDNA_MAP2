@@ -100,21 +100,6 @@ python scripts/predict.py --input data/test_long.fa --mode long --limit 0.75
 python scripts/batch_process.py --input-dir data/raw --threads 16 --cleanup
 ```
 
-### 基因组直接扫描
-
-使用 `run_microdna_map_direct.py` 直接利用模型扫描参考基因组序列以发现候选区间。
-
-可选参数：
-
-* `--reference` 参考基因组路径。
-* `--region` 指定扫描的区域或染色体，支持多次传递。
-* `--limit` 识别阈值，默认 0.75。
-* `--segment_length` 内存切块大小限制。
-
-```bash
-python benchmark/detect/run_microdna_map_direct.py --reference refs/hg19.fa --region chr21 --region chr22 --limit 0.75
-```
-
 ---
 
 ## 开发者指南
