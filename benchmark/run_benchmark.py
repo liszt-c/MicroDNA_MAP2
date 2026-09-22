@@ -22,7 +22,7 @@ from typing import List, Optional, Tuple
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 BENCHMARK_DIR = Path(__file__).resolve().parent
-DEFAULT_CONFIG = BENCHMARK_DIR / "config.yaml"
+DEFAULT_CONFIG = BENCHMARK_DIR / "config_real.yaml"
 
 
 def load_config(config_path: Path) -> dict:
@@ -30,7 +30,7 @@ def load_config(config_path: Path) -> dict:
         print(f"[ERROR] 配置文件不存在: {config_path}", file=sys.stderr)
         sys.exit(1)
     import yaml
-    with open(config_path, "r") as f:
+    with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     if not isinstance(cfg, dict):
         print("[ERROR] 配置文件格式错误", file=sys.stderr)
@@ -50,7 +50,7 @@ def run_cmd(cmd: List[str], cwd: Optional[Path] = None, dry_run: bool = False) -
 
 
 def check_dependencies() -> Tuple[bool, List[str]]:
-    tools = ["python", "samtools", "bowtie2", "bwa", "cnvkit.py"]
+    tools = ["python", "samtools", "bowtie2", "bwa"]
     missing = [t for t in tools if shutil.which(t) is None]
     import importlib.util
     for pkg in ["pysam", "yaml", "torch", "matplotlib", "pandas", "seaborn"]:
@@ -60,7 +60,7 @@ def check_dependencies() -> Tuple[bool, List[str]]:
 
 
 def phase0_check(config: dict, dry_run: bool = False) -> int:
-    print("\n=== Phase 0: 环境检查 ===")
+    print("\n=== Phase 0: 环境与参考索引检查 ===")
     ok, missing = check_dependencies()
     if not ok:
         print("[ERROR] 缺少依赖:", ", ".join(missing))
@@ -70,24 +70,47 @@ def phase0_check(config: dict, dry_run: bool = False) -> int:
     if not genome.exists():
         print(f"[ERROR] 参考基因组不存在: {genome}")
         return 1
+    print(f"[INFO] 统一参考基因组定位: {genome}")
 
-    if not (genome.parent / (genome.name + ".fai")).exists():
-        print("[WARN] 参考基因组 .fai 索引不存在，将在需要时自动创建")
+    # 1. 检查 / 创建 samtools faidx (.fai)
+    fai_file = Path(str(genome) + ".fai")
+    if not fai_file.exists():
+        print(f"[INFO] 正在为 {genome.name} 创建 .fai 索引...")
+        if not dry_run:
+            subprocess.run(["samtools", "faidx", str(genome)], check=True)
+    else:
+        print(f"[INFO] FASTA .fai 索引已存在: {fai_file.name}")
 
-    if not Path(str(genome) + ".bwt").exists():
-        print("[WARN] BWA 索引不存在，将在 Circle-Map 流程中自动创建")
+    # 2. 检查 / 创建 BWA 索引
+    bwa_exts = [".amb", ".ann", ".bwt", ".pac", ".sa"]
+    if not all(Path(str(genome) + ext).exists() for ext in bwa_exts):
+        print(f"[INFO] 正在为 {genome.name} 创建 BWA 索引 (Circle-Map 所需)...")
+        if not dry_run:
+            subprocess.run(["bwa", "index", str(genome)], check=True)
+    else:
+        print("[INFO] BWA 索引已存在")
+
+    # 3. 检查 / 创建 Bowtie2 索引
+    bt2_prefix = genome.parent / genome.stem
+    bt2_small = [".1.bt2", ".2.bt2", ".3.bt2", ".4.bt2", ".rev.1.bt2", ".rev.2.bt2"]
+    bt2_large = [".1.bt2l", ".2.bt2l", ".3.bt2l", ".4.bt2l", ".rev.1.bt2l", ".rev.2.bt2l"]
+    has_bt2 = all(Path(str(bt2_prefix) + ext).exists() for ext in bt2_small) or \
+              all(Path(str(bt2_prefix) + ext).exists() for ext in bt2_large)
+
+    if not has_bt2:
+        print(f"[INFO] 正在为 {genome.name} 创建 Bowtie2 索引: {bt2_prefix} ...")
+        if not dry_run:
+            subprocess.run(["bowtie2-build", str(genome), str(bt2_prefix)], check=True)
+    else:
+        print(f"[INFO] Bowtie2 索引已存在: {bt2_prefix}")
 
     model = Path(config["detection"]["microdna_map_model"])
     if not model.exists():
-        print(f"[WARN] 模型文件不存在: {model}")
+        print(f"[WARN] 模型权重文件不存在: {model}")
+    else:
+        print(f"[INFO] 模型权重定位: {model}")
 
-    cnvkit_ref = config["genome"].get("cnvkit_reference")
-    if cnvkit_ref:
-        if not Path(cnvkit_ref).exists():
-            print(f"[ERROR] CNVkit 参考文件不存在: {cnvkit_ref}")
-            return 1
-
-    print("[INFO] 环境检查完成")
+    print("[INFO] 环境与参考基因组索引检查完毕，全局已就绪\n")
     return 0
 
 
@@ -223,8 +246,9 @@ def phase5_microdna_wgs(config: dict, dry_run: bool = False) -> int:
     model = config["detection"]["microdna_map_model"]
     limit = config["detection"]["microdna_map_limit"]
     cnvkit_ref = config["genome"].get("cnvkit_reference")
+    pipeline_type = config["detection"].get("pipeline", "micro_coverage")
+    fold_change = config["detection"].get("fold_change", 1.3)
     
-    # 提取预设的合法背景染色体
     if config.get("quick", False):
         allowed_chroms = ",".join(config["genome"]["quick_chromosomes"])
     else:
@@ -242,9 +266,11 @@ def phase5_microdna_wgs(config: dict, dry_run: bool = False) -> int:
                "--reference", str(config["genome"]["reference"]),
                "--output_dir", str(out_dir), "--model_path", str(model),
                "--limit", str(limit), "--threads", str(threads),
-               "--allowed_chroms", allowed_chroms]  # 增加过滤参数
+               "--allowed_chroms", allowed_chroms,
+               "--pipeline", str(pipeline_type),
+               "--fold_change", str(fold_change)]
         
-        if cnvkit_ref and Path(cnvkit_ref).exists():
+        if cnvkit_ref and Path(cnvkit_ref).exists() and pipeline_type == "cnvkit":
             cmd += ["--cnvkit_reference", str(cnvkit_ref)]
             
         if run_cmd(cmd, dry_run=dry_run, cwd=PROJECT_ROOT) != 0:
@@ -286,6 +312,9 @@ def phase7_microdna_circseq(config: dict, dry_run: bool = False) -> int:
     model = config["detection"]["microdna_map_model"]
     limit = config["detection"]["microdna_map_limit"]
     cnvkit_ref = config["genome"].get("cnvkit_reference")
+    pipeline_type = config["detection"].get("pipeline", "micro_coverage")
+    fold_change = config["detection"].get("fold_change", 1.3)
+
     for cn in config["simulation"]["copy_numbers"]:
         r1 = circseq_dir / f"cn{cn}" / "circseq_R1.fastq"
         r2 = circseq_dir / f"cn{cn}" / "circseq_R2.fastq"
@@ -296,8 +325,10 @@ def phase7_microdna_circseq(config: dict, dry_run: bool = False) -> int:
         cmd = [sys.executable, str(script), "--r1", str(r1), "--r2", str(r2),
                "--reference", str(config["genome"]["reference"]),
                "--output_dir", str(out_dir), "--model_path", str(model),
-               "--limit", str(limit), "--threads", str(threads)]
-        if cnvkit_ref and Path(cnvkit_ref).exists():
+               "--limit", str(limit), "--threads", str(threads),
+               "--pipeline", str(pipeline_type),
+               "--fold_change", str(fold_change)]
+        if cnvkit_ref and Path(cnvkit_ref).exists() and pipeline_type == "cnvkit":
             cmd += ["--cnvkit_reference", str(cnvkit_ref)]
         if run_cmd(cmd, dry_run=dry_run, cwd=PROJECT_ROOT) != 0:
             return 1
@@ -410,6 +441,22 @@ def main() -> None:
     args = parser.parse_args()
 
     config = load_config(args.config)
+    
+    # 路径自适应绝对化解析：统一锚定到 PROJECT_ROOT，防止由于执行工作目录变动而导致路径断裂
+    ref_path = Path(config["genome"]["reference"])
+    if not ref_path.is_absolute():
+        config["genome"]["reference"] = str((PROJECT_ROOT / ref_path).resolve())
+
+    if config["genome"].get("cnvkit_reference"):
+        cnn_path = Path(config["genome"]["cnvkit_reference"])
+        if not cnn_path.is_absolute():
+            config["genome"]["cnvkit_reference"] = str((PROJECT_ROOT / cnn_path).resolve())
+
+    if config["detection"].get("microdna_map_model"):
+        model_path = Path(config["detection"]["microdna_map_model"])
+        if not model_path.is_absolute():
+            config["detection"]["microdna_map_model"] = str((PROJECT_ROOT / model_path).resolve())
+
     if args.quick:
         config["quick"] = True
         config["simulation"]["num_sites"] = config["simulation"].get("quick_num_sites", 100)
@@ -434,10 +481,8 @@ def main() -> None:
         9: phase9_visualize,
     }
 
-    # 解析逗号分隔的 phase 参数
     if args.phase is not None:
         try:
-            # 剥离两边空格、按逗号切分，转换为整数并去重排序
             to_run = sorted(list(set(int(p.strip()) for p in args.phase.split(","))))
             for p in to_run:
                 if p not in phases:

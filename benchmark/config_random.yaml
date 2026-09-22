@@ -4,7 +4,7 @@ experiment:
   output_dir: "./benchmark/results_random"
 
 genome:
-  reference: "./benchmark/hg19.fa"
+  reference: "./refs/hg19.fa"
   reference_name: "hg19"
   gap_bed: null
   quick_chromosomes: ["chr21", "chr22"]
@@ -32,7 +32,7 @@ circseq:
   coverage_per_copy: 30
 
 detection:
-  microdna_map_model: "./models/32_best_model_nohnm.pth"
+  microdna_map_model: "./models/hnm3_size8_newdata.pth"
   microdna_map_limit: "0.85"
   circlemmap_threads: 8
   threads: 8
