@@ -274,9 +274,9 @@ benchmark/
 
 ```
 
-### 1. Channel Capacity Ablation (`scripts/ablation_layer_size.py`)
+### 1. Ablation Study (`scripts/ablation_layer_size.py`)
 
-Tests different base channel configurations to determine optimal network capacity.
+Tests different base channel configurations to determine optimal model size.
 
 Common Arguments:
 
