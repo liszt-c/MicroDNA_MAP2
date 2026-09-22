@@ -70,10 +70,15 @@ SLIDE_STEP2 = 3         # 第二次滑动步长 (窗口数)
 
 # 微尺度局部覆盖度分析参数 (针对 microDNA 物理尺度设计)
 DEFAULT_MICRO_WINDOW_SIZE = 200      # 微窗口大小 (bp)
+DEFAULT_MICRO_STEP_SIZE = 100        # 步长 (bp), 默认 50% 重叠滑窗, 彻底解决网格截断误杀
 DEFAULT_MICRO_FOLD_CHANGE = 1.3      # 局部富集判定倍数
+DEFAULT_MICRO_EXEMPT_FOLD_CHANGE = 1.8 # 强单窗口高置信度直接激活豁免门
+DEFAULT_MICRO_RELAX_RATIO = 0.5      # 相邻窗口弛豫阈值比率 (即 tau + (1.0-tau)*0.5 = 1.15)
 DEFAULT_MICRO_MIN_LEN = 150          # 单分子长度下限 (bp)
 DEFAULT_MICRO_MAX_LEN = 1000         # 单分子长度典型上限 (bp)
 DEFAULT_MICRO_CLUSTER_MAX_LEN = 5000 # 宽富集簇 (Cluster) 容忍上限 (bp)
+DEFAULT_MICRO_LOCAL_BASELINE_WINDOW = 20000 # 局部滑动基线平滑尺度 (bp)
+DEFAULT_MICRO_GC_CORRECTION = True   # 是否开启经验分箱 GC 偏好性校正
 
 # 外部工具路径 (确保在 PATH 中, 或在此改为绝对路径)
 BOWTIE2 = "bowtie2"

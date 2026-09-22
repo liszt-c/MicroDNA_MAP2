@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-src/pipeline/micro_coverage_pipeline.py - 微尺度局部覆盖度分析流程 (独立模块)
+src/pipeline/micro_coverage_pipeline.py - 微尺度局部覆盖度分析流程 (自研增强版)
+
+改进亮点:
+1. 几何重叠窗口 (100 bp 步长, 200 bp 窗口): 物理上覆盖任意 >=150 bp 的微环, 根除网格相位截断误杀。
+2. 经验分箱 GC 偏好性矫正: 抹平 PCR 扩增失真, 引入 [0.33, 3.0] 截断防止极端 GC 区域方差爆炸。
+3. 局部滑动基线 (20 kb Rolling Baseline): 适应染色体大尺度常/异染色质起伏, 仅捕获微小局部突起。
+4. 双窗口连续性门控 + 强单窗口豁免门: 中低丰度强制相邻窗口联合验证, 极端高丰度直接豁免。
+5. 深度自适应机制: 对常规 30X 与浅层 sWGS (<5X) 数据智能切换判别逻辑。
 """
 
 import math
@@ -16,9 +23,14 @@ from config import (
     BOWTIE2,
     BOWTIE2_BUILD,
     DEFAULT_MICRO_CLUSTER_MAX_LEN,
+    DEFAULT_MICRO_EXEMPT_FOLD_CHANGE,
     DEFAULT_MICRO_FOLD_CHANGE,
+    DEFAULT_MICRO_GC_CORRECTION,
+    DEFAULT_MICRO_LOCAL_BASELINE_WINDOW,
     DEFAULT_MICRO_MAX_LEN,
     DEFAULT_MICRO_MIN_LEN,
+    DEFAULT_MICRO_RELAX_RATIO,
+    DEFAULT_MICRO_STEP_SIZE,
     DEFAULT_MICRO_WINDOW_SIZE,
     HG19_FA,
     MICRO_COVERAGE_TEMP_DIR,
@@ -39,11 +51,16 @@ class MicroCoveragePipeline:
         output_dir: Optional[Path] = None,
         ref_genome: Optional[Path] = None,
         window_size: int = DEFAULT_MICRO_WINDOW_SIZE,
+        step_size: int = DEFAULT_MICRO_STEP_SIZE,
         fold_change: float = DEFAULT_MICRO_FOLD_CHANGE,
+        exempt_fold_change: float = DEFAULT_MICRO_EXEMPT_FOLD_CHANGE,
+        relax_ratio: float = DEFAULT_MICRO_RELAX_RATIO,
         min_region_len: int = DEFAULT_MICRO_MIN_LEN,
         max_region_len: int = DEFAULT_MICRO_MAX_LEN,
         cluster_max_len: int = DEFAULT_MICRO_CLUSTER_MAX_LEN,
         flank_bins: int = 1,
+        local_baseline_window: int = DEFAULT_MICRO_LOCAL_BASELINE_WINDOW,
+        gc_correction: bool = DEFAULT_MICRO_GC_CORRECTION,
     ):
         self.output_dir = Path(output_dir) if output_dir else MICRO_COVERAGE_TEMP_DIR
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -57,11 +74,19 @@ class MicroCoveragePipeline:
         self.index_prefix = self.ref_genome.parent / self.ref_genome.stem
 
         self.window_size = int(window_size)
+        self.step_size = int(step_size)
         self.fold_change = float(fold_change)
+        self.exempt_fold_change = float(exempt_fold_change)
+        self.relax_ratio = float(relax_ratio)
         self.min_region_len = int(min_region_len)
         self.max_region_len = int(max_region_len)
         self.cluster_max_len = int(cluster_max_len)
         self.flank_bins = int(flank_bins)
+        self.local_baseline_window = int(local_baseline_window)
+        self.gc_correction = bool(gc_correction)
+
+        # 染色体 GC 缓存，避免多样本重复提取参考基因组
+        self._gc_cache: Dict[str, np.ndarray] = {}
 
     def build_index(self) -> None:
         """构建 Bowtie2 索引 (若缺失)"""
@@ -101,12 +126,108 @@ class MicroCoveragePipeline:
         logger.info(f"[{sample_name}] BAM ready: {bam_file}")
         return bam_file
 
-    def _merge_candidate_regions(self, regions: List[Tuple[str, int, int, float]]) -> List[Tuple[str, int, int, float]]:
+    def _get_chromosome_window_gc(self, chrom: str, chrom_len: int, num_windows: int) -> np.ndarray:
+        """
+        快速计算整条染色体上每个滑动窗口的 GC 比例 (0 到 100)。
+        先按 step_size 原子切片统计，再通过滑动累加得到 window_size 的 GC 含量。
+        """
+        if chrom in self._gc_cache:
+            cached = self._gc_cache[chrom]
+            if len(cached) == num_windows:
+                return cached
+
+        ensure_faidx(self.ref_genome, SAMTOOLS)
+        with pysam.FastaFile(str(self.ref_genome)) as fa:
+            seq = fa.fetch(chrom, 0, chrom_len).upper()
+
+        # 计算每个 step_size (100 bp) 原子切片的 GC 数和长度
+        atomic_bins = int(math.ceil(chrom_len / self.step_size))
+        atomic_gc = np.zeros(atomic_bins, dtype=np.int32)
+        atomic_len = np.zeros(atomic_bins, dtype=np.int32)
+
+        for i in range(atomic_bins):
+            st = i * self.step_size
+            en = min(st + self.step_size, chrom_len)
+            sub = seq[st:en]
+            atomic_len[i] = len(sub)
+            if len(sub) > 0:
+                atomic_gc[i] = sub.count("G") + sub.count("C")
+
+        # 将原子切片聚合成 window_size 窗口 (例如 2 个 100 bp 组成 200 bp 窗口)
+        bins_per_win = max(1, self.window_size // self.step_size)
+        if bins_per_win == 1:
+            win_gc = atomic_gc[:num_windows]
+            win_len = atomic_len[:num_windows]
+        else:
+            cumsum_gc = np.cumsum(np.insert(atomic_gc, 0, 0))
+            cumsum_len = np.cumsum(np.insert(atomic_len, 0, 0))
+            win_gc = (cumsum_gc[bins_per_win:] - cumsum_gc[:-bins_per_win])[:num_windows]
+            win_len = (cumsum_len[bins_per_win:] - cumsum_len[:-bins_per_win])[:num_windows]
+
+        gc_percent = np.zeros(num_windows, dtype=np.uint8)
+        valid_mask = win_len > 0
+        gc_percent[valid_mask] = np.round(100.0 * win_gc[valid_mask] / win_len[valid_mask]).astype(np.uint8)
+
+        self._gc_cache[chrom] = gc_percent
+        return gc_percent
+
+    def _apply_gc_correction(
+        self, window_counts: np.ndarray, gc_array: np.ndarray, global_baseline: float
+    ) -> np.ndarray:
+        """
+        经验分箱 GC 校正:
+        1. 统计各 GC 梯度的非零窗口中位数。
+        2. 施加 [0.33, 3.0] 截断约束，防止低深度极端 GC 区域发生方差爆炸。
+        """
+        if not self.gc_correction or global_baseline <= 0:
+            return window_counts.astype(np.float32)
+
+        norm_factors = np.ones(101, dtype=np.float32)
+        non_zero = window_counts > 0
+
+        for g in range(101):
+            mask_g = (gc_array == g) & non_zero
+            if np.sum(mask_g) >= 50:
+                med = float(np.median(window_counts[mask_g]))
+                if med > 0:
+                    raw_factor = global_baseline / med
+                    # 关键安全截断 (Clamping): 严格限制在 [0.33, 3.0] 倍以内
+                    norm_factors[g] = float(np.clip(raw_factor, 0.33, 3.0))
+                else:
+                    norm_factors[g] = 1.0
+            else:
+                norm_factors[g] = 1.0
+
+        corrected = window_counts.astype(np.float32) * norm_factors[gc_array]
+        return corrected
+
+    def _compute_local_baseline(
+        self, counts: np.ndarray, global_baseline: float
+    ) -> np.ndarray:
+        """
+        基于 20 kb 滑动平均计算局部染色质波状起伏基线。
+        并将其限制在 [0.5 * global_baseline, 1.8 * global_baseline]，保持数值稳健。
+        """
+        window_pts = max(10, self.local_baseline_window // self.step_size)
+        if len(counts) <= window_pts:
+            return np.full_like(counts, fill_value=global_baseline, dtype=np.float32)
+
+        pad_width = window_pts // 2
+        padded = np.pad(counts, pad_width, mode="edge")
+        cumsum = np.cumsum(np.insert(padded, 0, 0))
+        rolling_sum = cumsum[window_pts:] - cumsum[:-window_pts]
+        local_mean = rolling_sum[:len(counts)] / float(window_pts)
+
+        clamped = np.clip(local_mean, 0.5 * global_baseline, 1.8 * global_baseline)
+        return clamped.astype(np.float32)
+
+    def _merge_candidate_regions(
+        self, regions: List[Tuple[str, int, int, float]]
+    ) -> List[Tuple[str, int, int, float]]:
         """合并扩展后发生重叠或相邻的候选区间"""
         if not regions:
             return []
 
-        # 按染色体、起始坐标排序
         sorted_regions = sorted(regions, key=lambda x: (x[0], x[1], x[2]))
         merged = []
 
@@ -117,7 +238,6 @@ class MicroCoveragePipeline:
 
             last = merged[-1]
             if chrom == last[0] and s <= last[2]:
-                # 产生重叠，更新终止位置，并保留更高的 log2 富集度
                 last[2] = max(last[2], e)
                 last[3] = max(last[3], l2)
             else:
@@ -133,20 +253,19 @@ class MicroCoveragePipeline:
         allowed_chroms: Optional[set] = None,
     ) -> Path:
         """
-        微尺度滑动窗口局部深度扫描，产出与 CNVkit .call.cns 兼容的 TSV 格式。
-        输出格式: chromosome\tstart\tend\tlog2 (1-based 闭区间)
+        微尺度测序深度扫描主函数。
+        输出格式: chromosome\\tstart\\tend\\tlog2 (1-based 闭区间)
         """
         bam_file = Path(bam_file)
         if not bam_file.exists():
             raise FileNotFoundError(f"BAM file not found: {bam_file}")
 
         ensure_bam_index(bam_file, SAMTOOLS)
-
         call_out = self.output_dir / f"{sample_name}.call.cns"
         logger.info(
-            f"[{sample_name}] Scanning micro-scale coverage "
-            f"(window={self.window_size}bp, fold_change={self.fold_change}, "
-            f"flank_bins={self.flank_bins}, cluster_max={self.cluster_max_len}bp)..."
+            f"[{sample_name}] Running enhanced micro-scale coverage profiling "
+            f"(window={self.window_size}bp, step={self.step_size}bp, "
+            f"fold_change={self.fold_change}, exempt_fc={self.exempt_fold_change})..."
         )
 
         raw_candidates: List[Tuple[str, int, int, float]] = []
@@ -161,8 +280,9 @@ class MicroCoveragePipeline:
                 if chrom_len < self.window_size:
                     continue
 
-                num_bins = int(math.ceil(chrom_len / self.window_size))
-                counts = np.zeros(num_bins, dtype=np.uint32)
+                # 1. 以 step_size (100 bp) 为原子切片累加高质量读段
+                num_atomic_bins = int(math.ceil(chrom_len / self.step_size))
+                atomic_counts = np.zeros(num_atomic_bins, dtype=np.uint32)
 
                 try:
                     for read in bam.fetch(chrom):
@@ -176,72 +296,105 @@ class MicroCoveragePipeline:
                         ):
                             continue
 
-                        read_span = read.reference_end - read.reference_start
-                        if read_span <= 0 or read_span > 1000:
+                        span = read.reference_end - read.reference_start
+                        if span <= 0 or span > 1000:
                             continue
 
-                        s_bin = max(0, min(read.reference_start // self.window_size, num_bins - 1))
-                        e_bin = max(0, min((read.reference_end - 1) // self.window_size, num_bins - 1))
-                        counts[s_bin : e_bin + 1] += 1
+                        s_bin = max(0, min(read.reference_start // self.step_size, num_atomic_bins - 1))
+                        e_bin = max(0, min((read.reference_end - 1) // self.step_size, num_atomic_bins - 1))
+                        atomic_counts[s_bin : e_bin + 1] += 1
                 except Exception as e:
                     logger.warning(f"Error fetching reads on {chrom}: {e}")
                     continue
 
-                non_zero = counts[counts > 0]
+                # 2. 构造 50% 重叠的滑动窗口计数
+                bins_per_win = max(1, self.window_size // self.step_size)
+                if num_atomic_bins < bins_per_win:
+                    continue
+
+                num_windows = num_atomic_bins - bins_per_win + 1
+                cumsum_counts = np.cumsum(np.insert(atomic_counts, 0, 0))
+                window_counts = (cumsum_counts[bins_per_win:] - cumsum_counts[:-bins_per_win])[:num_windows]
+
+                non_zero = window_counts[window_counts > 0]
                 if len(non_zero) == 0:
                     continue
 
-                baseline = float(np.median(non_zero))
-                baseline = max(baseline, 1.0)
-                cutoff = baseline * self.fold_change
-                min_reads_diff = max(3, int(round(0.1 * baseline)))
+                global_baseline = float(np.median(non_zero))
+                global_baseline = max(global_baseline, 1.0)
 
-                enriched_mask = (counts >= cutoff) & ((counts.astype(np.float32) - baseline) >= min_reads_diff)
+                # 3. 计算并应用 GC 校正 (带 Clamping 保护)
+                gc_array = self._get_chromosome_window_gc(chrom, chrom_len, num_windows)
+                corrected_counts = self._apply_gc_correction(window_counts, gc_array, global_baseline)
+
+                # 4. 计算 20 kb 局部平滑基线
+                local_baseline = self._compute_local_baseline(corrected_counts, global_baseline)
+
+                # 5. 双窗口连续性检验 + 强单窗口高丰度豁免门 + sWGS 浅层测序自适应
+                is_low_coverage = global_baseline < 5.0
+                if is_low_coverage:
+                    # sWGS 浅层测序模式: 放弃连续双窗口约束，采用单窗口稳健倍数
+                    diff_req = 1.0
+                    cutoff_swgs = np.maximum(2.0, local_baseline * max(1.5, self.fold_change))
+                    enriched_mask = (corrected_counts >= cutoff_swgs) & ((corrected_counts - local_baseline) >= diff_req)
+                else:
+                    # 常规 WGS 模式: 执行严格的三重门控
+                    cutoff_main = local_baseline * self.fold_change
+                    cutoff_exempt = local_baseline * self.exempt_fold_change
+                    cutoff_relax = local_baseline * (1.0 + (self.fold_change - 1.0) * self.relax_ratio)
+                    diff_req = np.maximum(3.0, 0.1 * local_baseline)
+
+                    is_candidate = (corrected_counts >= cutoff_main) & ((corrected_counts - local_baseline) >= diff_req)
+                    is_exempt = (corrected_counts >= cutoff_exempt) & ((corrected_counts - local_baseline) >= diff_req * 1.5)
+                    is_neighbor = corrected_counts >= cutoff_relax
+
+                    left_ok = np.pad(is_neighbor[:-1], (1, 0), constant_values=False)
+                    right_ok = np.pad(is_neighbor[1:], (0, 1), constant_values=False)
+
+                    # 激活逻辑: 超高丰度单窗口直接豁免; 中低丰度必须至少有一个邻居达标
+                    enriched_mask = is_exempt | (is_candidate & (left_ok | right_ok))
+
                 enriched_indices = np.where(enriched_mask)[0]
                 if len(enriched_indices) == 0:
                     continue
 
-                # 聚类缝合
-                cur_start_bin = enriched_indices[0]
-                cur_end_bin = enriched_indices[0] + 1
+                # 6. 聚类缝合与区间合并
+                cur_start_idx = enriched_indices[0]
+                cur_end_idx = enriched_indices[0] + 1
 
                 for idx in enriched_indices[1:]:
-                    if idx <= cur_end_bin + 1:
-                        new_span = (idx + 1 - cur_start_bin) * self.window_size
+                    # 允许内部跳过至多 1 个步长 (100 bp)
+                    if idx <= cur_end_idx + 1:
+                        new_span = (idx - cur_start_idx) * self.step_size + self.window_size
                         if new_span <= self.cluster_max_len:
-                            cur_end_bin = idx + 1
+                            cur_end_idx = idx + 1
                             continue
 
-                    # 扩展前后 flank_bins
-                    ext_s_bin = max(0, cur_start_bin - self.flank_bins)
-                    ext_e_bin = min(num_bins, cur_end_bin + self.flank_bins)
-
-                    reg_start = ext_s_bin * self.window_size
-                    reg_end = min(ext_e_bin * self.window_size, chrom_len)
+                    # 封闭当前区间
+                    reg_start = cur_start_idx * self.step_size
+                    reg_end = min((cur_end_idx - 1) * self.step_size + self.window_size, chrom_len)
                     span = reg_end - reg_start
 
-                    if span >= self.min_region_len:
-                        local_mean = float(np.mean(counts[cur_start_bin:cur_end_bin]))
-                        log2_val = math.log2((local_mean + 1e-4) / baseline)
+                    if self.min_region_len <= span <= self.cluster_max_len:
+                        local_mean = float(np.mean(corrected_counts[cur_start_idx:cur_end_idx]))
+                        mean_base = float(np.mean(local_baseline[cur_start_idx:cur_end_idx]))
+                        log2_val = math.log2((local_mean + 1e-4) / max(mean_base, 1e-4))
                         raw_candidates.append((chrom, reg_start + 1, reg_end, log2_val))
 
-                    cur_start_bin = idx
-                    cur_end_bin = idx + 1
+                    cur_start_idx = idx
+                    cur_end_idx = idx + 1
 
-                # 封闭最后一个区间
-                ext_s_bin = max(0, cur_start_bin - self.flank_bins)
-                ext_e_bin = min(num_bins, cur_end_bin + self.flank_bins)
-
-                reg_start = ext_s_bin * self.window_size
-                reg_end = min(ext_e_bin * self.window_size, chrom_len)
+                # 封闭末尾区间
+                reg_start = cur_start_idx * self.step_size
+                reg_end = min((cur_end_idx - 1) * self.step_size + self.window_size, chrom_len)
                 span = reg_end - reg_start
-
-                if span >= self.min_region_len:
-                    local_mean = float(np.mean(counts[cur_start_bin:cur_end_bin]))
-                    log2_val = math.log2((local_mean + 1e-4) / baseline)
+                if self.min_region_len <= span <= self.cluster_max_len:
+                    local_mean = float(np.mean(corrected_counts[cur_start_idx:cur_end_idx]))
+                    mean_base = float(np.mean(local_baseline[cur_start_idx:cur_end_idx]))
+                    log2_val = math.log2((local_mean + 1e-4) / max(mean_base, 1e-4))
                     raw_candidates.append((chrom, reg_start + 1, reg_end, log2_val))
 
-        # 执行二次区间合并，剔除重叠冗余
+        # 执行全局二次合并，剔除重叠冗余
         final_candidates = self._merge_candidate_regions(raw_candidates)
 
         with open(call_out, "w", encoding="utf-8") as f:
@@ -251,7 +404,7 @@ class MicroCoveragePipeline:
 
         logger.info(
             f"[{sample_name}] Micro-coverage profiling finished. "
-            f"Identified {len(final_candidates)} candidate segment(s) after flank expansion -> {call_out.name}"
+            f"Identified {len(final_candidates)} candidate segment(s) -> {call_out.name}"
         )
         return call_out
 
