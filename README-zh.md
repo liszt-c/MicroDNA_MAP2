@@ -275,9 +275,9 @@ benchmark/
 
 ```
 
-### 1. 通道容量消融实验 (`scripts/ablation_layer_size.py`)
+### 1. 消融实验 (`scripts/ablation_layer_size.py`)
 
-自动化测试不同的 ResNet 通道配置，探索最佳模型容量。
+自动化测试不同的 ResNet 通道配置，探索最佳模型尺寸。
 
 常用参数说明：
 
